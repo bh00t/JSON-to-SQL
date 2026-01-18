@@ -220,9 +220,10 @@
                             arrayCount++;
                         }
                         let currentBase = pathSoFar ? \`\${pathSoFar}.\${partName}\` : partName;
-                        for (let i = 0; i < arrayCount; i++) {
+                        // Iterate from 1 to arrayCount to ensure [] are appended correctly
+                        for (let i = 1; i <= arrayCount; i++) {
                             let p = currentBase;
-                            for (let k = 0; k < i; k++) p += \"[]\";
+                            for (let k = 0; k < i; k++) p += "[]";
                             arrayPaths.add(p);
                         }
                         pathSoFar = pathSoFar ? \`\${pathSoFar}.\${part}\` : part;
@@ -231,9 +232,10 @@
                 return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
             };
 
+            // Enhanced getValue that is robust to empty path parts
             const getValue = (obj, path) => {
                 if (!path) return obj;
-                const parts = path.split('.');
+                const parts = path.split('.').filter(p => p !== "");
                 let current = obj;
                 for (let part of parts) {
                     if (current === null || current === undefined) return null;
@@ -298,9 +300,8 @@
                             if (contextObj !== null && contextObj !== undefined) {
                                 let relativePath = fullPath;
                                 if (deepestArrayPath) relativePath = fullPath.substring(deepestArrayPath.length);
-                                if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
-                                if (!relativePath) value = contextObj;
-                                else value = getValue(contextObj, relativePath.replace(/\\[\\]/g, ''));
+                                
+                                value = getValue(contextObj, relativePath.replace(/\\[\\]/g, ''));
                             }
                             const header = aliases[fullPath] || fullPath;
                             row[header] = (value !== null && typeof value === 'object') ? JSON.stringify(value) : value;
@@ -372,7 +373,7 @@
                         const flatData = generateFlattenedData(json, schema, aliases, limit);
                         self.postMessage({ type: 'FLATTEN_SUCCESS', payload: flatData });
                     } catch (err) {
-                        self.postMessage({ type: 'ERROR', payload: \"Flattening failed: \" + err.message });
+                        self.postMessage({ type: 'ERROR', payload: "Flattening failed: " + err.message });
                     }
                 } else if (type === 'CALC_TOTAL_ROWS') {
                      try {
@@ -1395,7 +1396,12 @@
                              // Inject effective alias into item data for row to use
                              const itemWithAlias = { ...item, effectiveAlias: effectiveAliases[item.field] };
                              // Check search filter for items
-                             if (!searchTerm || item.field.toLowerCase().includes(searchTerm.toLowerCase()) || item.type.toLowerCase().includes(searchTerm.toLowerCase())) {
+                             const lowerTerm = searchTerm.toLowerCase();
+                             if (!searchTerm || 
+                                 item.field.toLowerCase().includes(lowerTerm) || 
+                                 item.type.toLowerCase().includes(lowerTerm) ||
+                                 (itemWithAlias.effectiveAlias && itemWithAlias.effectiveAlias.toLowerCase().includes(lowerTerm))
+                             ) {
                                  rows.push({ type: 'leaf', data: itemWithAlias, depth: node.name === 'root' ? 0 : depth + 1 });
                              }
                          });
@@ -1408,6 +1414,26 @@
                 flatten(treeRoot, 0);
                 return rows;
             }, [schema, expandedPaths, searchTerm, effectiveAliases]);
+
+            // Corrected Logic: Calculate all filterable leaf items independent of view state (expansion)
+            const allFilteredLeaves = useMemo(() => {
+                if (!schema) return [];
+                if (!searchTerm) return schema;
+                
+                const lowerTerm = searchTerm.toLowerCase();
+                return schema.filter(item => {
+                     const alias = effectiveAliases[item.field] || "";
+                     return item.field.toLowerCase().includes(lowerTerm) || 
+                            item.type.toLowerCase().includes(lowerTerm) ||
+                            alias.toLowerCase().includes(lowerTerm);
+                });
+            }, [schema, searchTerm, effectiveAliases]);
+
+            const areAllFilteredSelected = allFilteredLeaves.length > 0 && allFilteredLeaves.every(item => selectedFields.has(item.field));
+
+            const handleSelectAllFiltered = (e) => {
+                onSelectAll(allFilteredLeaves, e.target.checked);
+            };
 
             if (!schema) return <div className="text-gray-500 p-4">No data to analyze.</div>;
 
@@ -1423,13 +1449,6 @@
             const topSpacerHeight = startIndex * rowHeight;
             // Fix bottom spacer calc to avoid negative
             const bottomSpacerHeight = Math.max(0, (totalRows - endIndex) * rowHeight);
-
-            const areAllFilteredSelected = flatRows.filter(r => r.type === 'leaf').every(r => selectedFields.has(r.data.field));
-
-            const handleSelectAllFiltered = (e) => {
-                const leafItems = flatRows.filter(r => r.type === 'leaf').map(r => r.data);
-                onSelectAll(leafItems, e.target.checked);
-            };
 
             // Helper to calculate node selection state for the row
             const getNodeSelectionState = (node) => {
@@ -1941,7 +1960,11 @@
               setExcludedFields(new Set());
               setSelectedFields(new Set());
               setSearchTerm('');
-              if (schemaData) setSchemaData(generateSchema(json, useSampling));
+              // Fix: generateSchema is only available in worker context. 
+              // We reset types to original using stored originalType property.
+              if (schemaData) {
+                  setSchemaData(prev => prev.map(item => ({ ...item, type: item.originalType })));
+              }
           };
 
           const onDragOver = (e) => { e.preventDefault(); setIsDragging(true); };
