@@ -1,0 +1,2318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JSON to SQL</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['Fira Code', 'monospace'],
+                    },
+                    animation: {
+                        'fade-in': 'fadeIn 0.2s ease-in-out',
+                        'slide-in': 'slideIn 0.3s ease-out',
+                    },
+                    keyframes: {
+                        fadeIn: {
+                            '0%': { opacity: '0' },
+                            '100%': { opacity: '1' },
+                        },
+                        slideIn: {
+                            '0%': { transform: 'translateY(10px)', opacity: '0' },
+                            '100%': { transform: 'translateY(0)', opacity: '1' },
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+
+    <!-- React & Babel -->
+    <script type="importmap">
+        {
+            "imports": {
+                "react": "https://esm.sh/react@18.2.0",
+                "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+                "lucide-react": "https://esm.sh/lucide-react@0.263.1"
+            }
+        }
+    </script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 5px;
+            border: 2px solid transparent;
+            background-clip: content-box;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background-color: #94a3b8;
+        }
+        .dark ::-webkit-scrollbar-thumb {
+            background-color: #475569;
+        }
+        .dark ::-webkit-scrollbar-thumb:hover {
+            background-color: #64748b;
+        }
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            overflow: hidden; /* Prevent body scroll */
+        }
+        
+        /* Optimization for large lists */
+        .virtual-list-container {
+            will-change: transform;
+            contain: strict; /* Performance optimization for scrolling */
+        }
+    </style>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 transition-colors duration-200 h-screen w-screen overflow-hidden">
+    <div id="root" class="h-full w-full"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import { 
+          Upload, FileJson, AlertCircle, X, ChevronRight, ChevronDown, 
+          CheckCircle, Trash2, ChevronLeft, Maximize2, Minimize2, 
+          MoreHorizontal, Database, Table, Code, Check, FileText, Copy, Eye, Settings, RefreshCw, Edit3, Search, Moon, Sun, Lightbulb, RotateCcw, Download, Loader2, Zap, Layers, ArrowUpNarrowWide,
+          PanelLeftClose, PanelLeftOpen, Undo2, Folder, FolderOpen, List, Grid, ToggleLeft, ToggleRight, Minus
+        } from 'lucide-react';
+
+        const MAX_FILE_SIZE_MB = 2; 
+        const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
+        const MAX_ITEMS_PREVIEW = 20; 
+        const MAX_STRING_LENGTH = 100;
+
+        const CATEGORIZED_TYPES = {
+            "Numeric": ['SMALLINT', 'INTEGER', 'BIGINT', 'DECIMAL', 'REAL', 'DOUBLE PRECISION'],
+            "Character": ['CHAR', 'VARCHAR', 'VARCHAR(256)', 'VARCHAR(65535)', 'TEXT'],
+            "Date & Time": ['DATE', 'TIMESTAMP', 'TIMESTAMPTZ'],
+            "Boolean": ['BOOLEAN'],
+            "Semi-structured": ['SUPER'],
+            "Other": ['GEOMETRY', 'VARBYTE']
+        };
+
+        // --- Custom Reusable Components ---
+
+        const Tooltip = ({ content, children, position = 'top', disabled = false }) => {
+          if (disabled || !content) return <>{children}</>;
+
+          const positions = {
+            top: 'bottom-full left-1/2 -translate-x-1/2 mb-2',
+            bottom: 'top-full left-1/2 -translate-x-1/2 mt-2',
+            left: 'right-full top-1/2 -translate-y-1/2 mr-2',
+            right: 'left-full top-1/2 -translate-y-1/2 ml-2'
+          };
+
+          return (
+            <div className="group relative inline-flex items-center justify-center">
+              {children}
+              <div className={`absolute ${positions[position]} px-2 py-1 bg-slate-900/75 dark:bg-slate-100/75 backdrop-blur-sm text-white dark:text-slate-900 text-[10px] md:text-xs font-medium rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 whitespace-nowrap z-[100] pointer-events-none`}>
+                {content}
+              </div>
+            </div>
+          );
+        };
+
+        // --- Pure Functions for Logic ---
+
+        const getRedshiftType = (value) => {
+          if (value === null) return 'VARCHAR(256)'; 
+          const type = typeof value;
+          if (type === 'boolean') return 'BOOLEAN';
+          if (type === 'number') return Number.isInteger(value) ? 'BIGINT' : 'DOUBLE PRECISION';
+          if (type === 'string') {
+            if (value.length >= 10 && value.length <= 30 && !isNaN(Date.parse(value)) && (value.includes('-') || value.includes('/'))) {
+              return value.includes(':') ? 'TIMESTAMP' : 'DATE';
+            }
+            if (value.length > 256) return 'VARCHAR(65535)';
+            return 'VARCHAR(256)';
+          }
+          if (Array.isArray(value)) return 'SUPER'; 
+          if (type === 'object') return 'SUPER'; 
+          return 'VARCHAR(256)';
+        };
+
+        const generateSchema = (data, useSampling = false) => {
+          const fieldMap = new Map();
+
+          let dataToProcess = data;
+          if (useSampling && Array.isArray(data) && data.length > 500) {
+              const subset = [];
+              subset.push(...data.slice(0, 20));
+              const step = Math.ceil(data.length / 200);
+              for(let i = 20; i < data.length; i += step) {
+                  subset.push(data[i]);
+              }
+              dataToProcess = subset;
+          }
+
+          const registerField = (path, value) => {
+              const redshiftType = getRedshiftType(value);
+              if (!fieldMap.has(path)) {
+                  fieldMap.set(path, { type: redshiftType, sample: value });
+              } else {
+                  const current = fieldMap.get(path);
+                  if (current.sample === null && value !== null) {
+                      fieldMap.set(path, { type: redshiftType, sample: value });
+                  }
+              }
+          };
+
+          const traverse = (currentValue, currentPath) => {
+            if (currentValue === null) {
+                registerField(currentPath, null);
+                return;
+            }
+            if (Array.isArray(currentValue)) {
+                if (currentValue.length === 0) {
+                    registerField(currentPath, []); 
+                    return;
+                }
+                const nextPathBase = currentPath ? `${currentPath}[]` : ''; 
+                currentValue.forEach(item => traverse(item, nextPathBase));
+                return;
+            }
+            if (typeof currentValue === 'object') {
+                const keys = Object.keys(currentValue);
+                if (keys.length === 0) {
+                     registerField(currentPath, {}); 
+                     return;
+                }
+                keys.forEach(key => {
+                    const nextPath = currentPath ? `${currentPath}.${key}` : key;
+                    traverse(currentValue[key], nextPath);
+                });
+                return;
+            }
+            registerField(currentPath, currentValue);
+          };
+
+          if (Array.isArray(dataToProcess)) {
+              dataToProcess.forEach(item => traverse(item, ''));
+          } else {
+              traverse(dataToProcess, '');
+          }
+
+          return Array.from(fieldMap.entries())
+            .filter(([field]) => field !== '') 
+            .map(([field, info]) => ({
+              field,
+              type: info.type,
+              originalType: info.type, 
+              sample: info.sample
+            }));
+        };
+
+        // --- Worker Builder ---
+        const createWorker = () => {
+            const workerCode = `
+              const getRedshiftType = ${getRedshiftType.toString()};
+              const generateSchema = ${generateSchema.toString()};
+
+              // --- Flattening Logic simulating SQL LEFT JOIN UNNEST ---
+              const getArrayPaths = (schema) => {
+                  if (!schema) return [];
+                  const arrayPaths = new Set();
+                  schema.forEach(item => {
+                      const parts = item.field.split('.');
+                      let pathSoFar = "";
+                      parts.forEach(part => {
+                          let partName = part;
+                          let arrayCount = 0;
+                          while (partName.endsWith('[]')) {
+                              partName = partName.slice(0, -2);
+                              arrayCount++;
+                          }
+                          let currentBase = pathSoFar ? \`\${pathSoFar}.\${partName}\` : partName;
+                          for (let i = 0; i < arrayCount; i++) {
+                              let p = currentBase;
+                              for (let k = 0; k < i; k++) p += \"[]\";
+                              arrayPaths.add(p);
+                          }
+                          pathSoFar = pathSoFar ? \`\${pathSoFar}.\${part}\` : part;
+                      });
+                  });
+                  return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
+              };
+
+              const getValue = (obj, path) => {
+                  if (!path) return obj;
+                  const parts = path.split('.');
+                  let current = obj;
+                  for (let part of parts) {
+                      if (current === null || current === undefined) return null;
+                      current = current[part];
+                  }
+                  return current;
+              };
+
+              const calculateContextCount = (contexts, arrayPath, sortedArrays) => {
+                  const nextContexts = [];
+                  let parentArrayPath = "";
+                  for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
+                      if (arrayPath.startsWith(sortedArrays[i])) {
+                          parentArrayPath = sortedArrays[i];
+                          break;
+                      }
+                  }
+                  let relativePath = arrayPath;
+                  if (parentArrayPath) {
+                      relativePath = arrayPath.substring(parentArrayPath.length);
+                  }
+                  if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
+                  if (relativePath.endsWith('[]')) relativePath = relativePath.slice(0, -2);
+
+                  for (const ctx of contexts) {
+                      const parentData = ctx[parentArrayPath || ""];
+                      let arrayData = null;
+                      if (parentData) arrayData = getValue(parentData, relativePath);
+
+                      if (Array.isArray(arrayData) && arrayData.length > 0) {
+                          for (const item of arrayData) {
+                              nextContexts.push({ ...ctx, [arrayPath]: item });
+                          }
+                      } else {
+                          nextContexts.push({ ...ctx, [arrayPath]: null });
+                      }
+                  }
+                  return nextContexts;
+              };
+
+              const countTotalRows = (json, schema) => {
+                  const sortedArrays = getArrayPaths(schema);
+                  const dataToProcess = Array.isArray(json) ? json : [json];
+                  let totalCount = 0;
+
+                  for (const record of dataToProcess) {
+                      let contexts = [{ "": record }];
+                      for (const arrayPath of sortedArrays) {
+                          contexts = calculateContextCount(contexts, arrayPath, sortedArrays);
+                      }
+                      totalCount += contexts.length;
+                  }
+                  return totalCount;
+              };
+
+              const generateFlattenedData = (json, schema, aliases, limit) => {
+                  const sortedArrays = getArrayPaths(schema);
+                  const resultRows = [];
+                  const maxOutputRows = limit || 10000; 
+                  // CRITICAL FIX: Do NOT slice input json here. We must iterate all to find data until limit is hit.
+                  const dataToProcess = Array.isArray(json) ? json : [json];
+
+                  for (const record of dataToProcess) {
+                      if (resultRows.length >= maxOutputRows) break;
+                      
+                      let contexts = [{ "": record }];
+
+                      for (const arrayPath of sortedArrays) {
+                          const nextContexts = [];
+                          let parentArrayPath = "";
+                          for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
+                              if (arrayPath.startsWith(sortedArrays[i])) {
+                                  parentArrayPath = sortedArrays[i];
+                                  break;
+                              }
+                          }
+
+                          let relativePath = arrayPath;
+                          if (parentArrayPath) {
+                              relativePath = arrayPath.substring(parentArrayPath.length);
+                          }
+                          if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
+                          if (relativePath.endsWith('[]')) relativePath = relativePath.slice(0, -2);
+
+                          for (const ctx of contexts) {
+                              const parentData = ctx[parentArrayPath || ""];
+                              let arrayData = null;
+                              if (parentData) {
+                                  arrayData = getValue(parentData, relativePath);
+                              }
+
+                              if (Array.isArray(arrayData) && arrayData.length > 0) {
+                                  for (const item of arrayData) {
+                                      nextContexts.push({ ...ctx, [arrayPath]: item });
+                                  }
+                              } else {
+                                  nextContexts.push({ ...ctx, [arrayPath]: null });
+                              }
+                          }
+                          contexts = nextContexts;
+                          if (contexts.length > maxOutputRows) break; 
+                      }
+
+                      for (const ctx of contexts) {
+                          if (resultRows.length >= maxOutputRows) break;
+                          
+                          const row = {};
+                          schema.forEach(fieldItem => {
+                              const fullPath = fieldItem.field;
+                              let deepestArrayPath = "";
+                              for (const arrayPath of sortedArrays) {
+                                  if (fullPath === arrayPath || fullPath.startsWith(arrayPath + '.') || fullPath.startsWith(arrayPath + '[')) {
+                                      if (arrayPath.length > deepestArrayPath.length) deepestArrayPath = arrayPath;
+                                  }
+                              }
+
+                              const contextObj = ctx[deepestArrayPath || ""];
+                              let value = null;
+                              
+                              if (contextObj !== null && contextObj !== undefined) {
+                                  let relativePath = fullPath;
+                                  if (deepestArrayPath) {
+                                      relativePath = fullPath.substring(deepestArrayPath.length);
+                                  }
+                                  if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
+                                  
+                                  if (!relativePath) {
+                                      value = contextObj;
+                                  } else {
+                                      const cleanPath = relativePath.replace(/\\[\\]/g, ''); 
+                                      value = getValue(contextObj, cleanPath);
+                                  }
+                              }
+                              
+                              const header = aliases[fullPath] || fullPath;
+                              if (value !== null && typeof value === 'object') {
+                                  row[header] = JSON.stringify(value);
+                              } else {
+                                  row[header] = value;
+                              }
+                          });
+                          resultRows.push(row);
+                      }
+                  }
+                  return resultRows;
+              };
+
+              self.onmessage = function(e) {
+                  const { type, payload } = e.data;
+                  
+                  if (type === 'PROCESS_FILE') {
+                      try {
+                          const { text, useSampling } = payload;
+                          self.postMessage({ type: 'PROGRESS', payload: { status: 'Parsing JSON...', percent: 30 } });
+                          const parsed = JSON.parse(text);
+                          self.postMessage({ type: 'PROGRESS', payload: { status: 'Analyzing Schema...', percent: 60 } });
+                          const schema = generateSchema(parsed, useSampling);
+                          self.postMessage({ type: 'PROGRESS', payload: { status: 'Finalizing...', percent: 90 } });
+                          self.postMessage({ type: 'SUCCESS', payload: { json: parsed, schema: schema } });
+                      } catch (err) {
+                          self.postMessage({ type: 'ERROR', payload: err.message });
+                      }
+                  } else if (type === 'FLATTEN_DATA') {
+                      try {
+                          const { json, schema, aliases, limit } = payload;
+                          const flatData = generateFlattenedData(json, schema, aliases, limit);
+                          self.postMessage({ type: 'FLATTEN_SUCCESS', payload: flatData });
+                      } catch (err) {
+                          self.postMessage({ type: 'ERROR', payload: \"Flattening failed: \" + err.message });
+                      }
+                  } else if (type === 'CALC_TOTAL_ROWS') {
+                      try {
+                          const { json, schema } = payload;
+                          const count = countTotalRows(json, schema);
+                          self.postMessage({ type: 'TOTAL_ROWS_SUCCESS', payload: count });
+                      } catch (err) {
+                           console.error(err);
+                      }
+                  }
+              };
+            `;
+            const blob = new Blob([workerCode], { type: "application/javascript" });
+            return new Worker(URL.createObjectURL(blob));
+        };
+
+        function useDebounce(value, delay) {
+          const [debouncedValue, setDebouncedValue] = useState(value);
+          useEffect(() => {
+            const handler = setTimeout(() => setDebouncedValue(value), delay);
+            return () => clearTimeout(handler);
+          }, [value, delay]);
+          return debouncedValue;
+        }
+
+        // --- SQL Generation Logic ---
+        
+        const getArrayPaths = (schema) => {
+            if (!schema) return [];
+            const arrayPaths = new Set();
+            schema.forEach(item => {
+                const parts = item.field.split('.');
+                let pathSoFar = "";
+                parts.forEach(part => {
+                    let partName = part;
+                    let arrayCount = 0;
+                    while (partName.endsWith('[]')) {
+                        partName = partName.slice(0, -2);
+                        arrayCount++;
+                    }
+                    let currentBase = pathSoFar ? `${pathSoFar}.${partName}` : partName;
+                    for (let i = 0; i < arrayCount; i++) {
+                        let p = currentBase;
+                        for (let k = 0; k < i; k++) p += "[]";
+                        arrayPaths.add(p);
+                    }
+                    pathSoFar = pathSoFar ? `${pathSoFar}.${part}` : part;
+                });
+            });
+            return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
+        };
+
+        const generateUniqueAliases = (schema, columnAliases) => {
+            const usedAliases = new Set();
+            const aliasMap = {}; 
+            if (!schema) return {};
+
+            schema.forEach(item => {
+                if (columnAliases[item.field]) {
+                    aliasMap[item.field] = columnAliases[item.field];
+                    usedAliases.add(columnAliases[item.field]);
+                    return;
+                }
+                const cleanPath = item.field.replace(/\[\]/g, '');
+                const parts = cleanPath.split('.');
+                let startIdx = Math.max(1, parts.length - 2); 
+                if (parts.length === 1) startIdx = 0;
+                let foundUnique = false;
+                let candidate = "";
+                for (let i = startIdx; i >= 0; i--) {
+                    const suffixParts = parts.slice(i);
+                    const cleanSuffixParts = suffixParts.map(p => p.replace(/^[\$_]+/, ''));
+                    candidate = cleanSuffixParts.join('_').toLowerCase();
+                    if (!candidate) candidate = "col";
+                    if (!usedAliases.has(candidate)) {
+                        foundUnique = true;
+                        break;
+                    }
+                }
+                if (!foundUnique) {
+                    let counter = 2;
+                    while (usedAliases.has(`${candidate}_${counter}`)) {
+                        counter++;
+                    }
+                    candidate = `${candidate}_${counter}`;
+                }
+                usedAliases.add(candidate);
+                aliasMap[item.field] = candidate;
+            });
+            return aliasMap;
+        };
+
+        const getDefaultTableAlias = (path, index) => {
+            const name = path.split('.').pop();
+            return `t${index + 1}_${name ? name.replace(/[^a-zA-Z0-9]/g, '') : 'tbl'}`;
+        };
+
+        const generateSqlScript = (schema, tableAliases = {}, columnAliases = {}, config = {}) => {
+            if (!schema || schema.length === 0) return "-- No schema detected.";
+            
+            const { 
+                sourceTable = "raw_data.source_table", 
+                viewName = "schema.vw_data", 
+                jsonColumn = "data" 
+            } = config;
+
+            const sortedArrays = getArrayPaths(schema);
+            const aliases = { "": "src", ...tableAliases }; 
+            sortedArrays.forEach((path, index) => {
+                if (!aliases[path]) aliases[path] = getDefaultTableAlias(path, index);
+            });
+            const smartColAliases = generateUniqueAliases(schema, columnAliases);
+            
+            const selectLines = schema.map(item => {
+                let deepestArrayPath = "";
+                for (const arrayPath of sortedArrays) {
+                    if (item.field === arrayPath || item.field.startsWith(arrayPath + '.') || item.field.startsWith(arrayPath + '[')) {
+                         if (arrayPath.length > deepestArrayPath.length) deepestArrayPath = arrayPath;
+                    }
+                }
+
+                let parentAlias = aliases[deepestArrayPath] || "src";
+                let relativePath = item.field;
+                if (deepestArrayPath) {
+                    relativePath = item.field.substring(deepestArrayPath.length);
+                }
+                
+                let cleanRelative = relativePath.replace(/\[\]/g, '');
+                if (cleanRelative.startsWith('.')) cleanRelative = cleanRelative.substring(1);
+                
+                let selection;
+                
+                if (deepestArrayPath === "") {
+                     selection = cleanRelative ? `"${parentAlias}"."${jsonColumn}".${cleanRelative.split('.').map(p=>`"${p}"`).join('.')}` : `"${parentAlias}"."${jsonColumn}"`;
+                } else {
+                     if (!cleanRelative) {
+                         selection = `"${parentAlias}"`;
+                     } else {
+                         selection = `"${parentAlias}".${cleanRelative.split('.').map(p=>`"${p}"`).join('.')}`;
+                     }
+                }
+
+                const castType = item.type.toUpperCase();
+                const colAlias = smartColAliases[item.field];
+                return `    CAST(${selection} AS ${castType}) AS "${colAlias}"`;
+            });
+            
+            let fromClause = `FROM\n    "${sourceTable}" AS "${aliases[""] || "src"}"`;
+            
+            sortedArrays.forEach((arrayPath) => {
+                const alias = aliases[arrayPath];
+                let parentArrayPath = "";
+                
+                for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
+                    const potentialParent = sortedArrays[i];
+                    if (arrayPath.startsWith(potentialParent)) {
+                        parentArrayPath = potentialParent;
+                        break;
+                    }
+                }
+                
+                const parentAlias = parentArrayPath ? aliases[parentArrayPath] : (aliases[""] || "src");
+                let relativePath = arrayPath;
+                if (parentArrayPath) {
+                    relativePath = arrayPath.substring(parentArrayPath.length);
+                }
+                if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
+                
+                let joinExpr;
+                
+                if (relativePath === "[]") {
+                    joinExpr = `"${parentAlias}"`;
+                } else {
+                    let cleanProp = relativePath.replace(/\[\]/g, '');
+                    if (cleanProp.startsWith('.')) cleanProp = cleanProp.substring(1);
+
+                    if (parentArrayPath === "") {
+                        joinExpr = `"${parentAlias}"."${jsonColumn}".${cleanProp.split('.').map(p=>`"${p}"`).join('.')}`;
+                    } else {
+                        joinExpr = `"${parentAlias}".${cleanProp.split('.').map(p=>`"${p}"`).join('.')}`;
+                    }
+                }
+                
+                fromClause += `\n    LEFT JOIN ${joinExpr} AS "${alias}" ON TRUE`;
+            });
+            
+            const mainScript = `SET enable_case_sensitive_identifier to TRUE;\nCREATE OR REPLACE VIEW ${viewName} AS\nSELECT\n${selectLines.join(',\n')}\n${fromClause};`;
+            const grants = `\n\n/*\n-- Grant Access Examples:\nGRANT SELECT ON ${viewName} TO "user_name";\nGRANT SELECT ON ${viewName} TO GROUP "group_name";\n*/`;
+            
+            return mainScript + grants;
+        };
+
+        const generateTableDDL = (schema, columnAliases = {}, config = {}) => {
+          if (!schema || schema.length === 0) return "-- No schema detected.";
+          
+          const { tableName = "<schema.table_name>", diststyle = "AUTO", sortKeys = "" } = config; 
+          const smartColAliases = generateUniqueAliases(schema, columnAliases);
+          
+          const columnDefs = schema.map(item => {
+              const colAlias = smartColAliases[item.field];
+              const type = item.type;
+              return `    "${colAlias}" ${type}`;
+          });
+
+          let ddl = `CREATE TABLE ${tableName} (\n${columnDefs.join(',\n')}\n)\nDISTSTYLE ${diststyle}`;
+          
+          if (sortKeys && sortKeys.trim()) {
+              const keys = sortKeys.split(',').map(k => k.trim()).filter(k => k);
+              if (keys.length > 0) {
+                  const quotedKeys = keys.map(k => `"${k}"`).join(', ');
+                  ddl += `\nSORTKEY (${quotedKeys})`;
+              }
+          }
+          
+          ddl += ';';
+          
+          const grants = `\n\n/*\n-- Grant Access Examples:\nGRANT ALL ON ${tableName} TO "user_name";\nGRANT ALL ON ${tableName} TO GROUP "group_name";\n*/`;
+
+          return ddl + grants;
+        };
+
+        // --- UI Helper Components ---
+        // ... (HighlightText, HighlightSql, FormattedField, DataTypeSelect, SortKeySelector, JsonPrimitive, JsonNode, DataPreview, buildSchemaTree components remain unchanged) ...
+
+        const HighlightText = React.memo(({ text, highlight }) => {
+            const safeText = String(text || '');
+            if (!highlight || !safeText) return <span>{safeText}</span>;
+            try {
+                const parts = safeText.split(new RegExp(`(${highlight})`, 'gi'));
+                return (
+                    <span>
+                        {parts.map((part, i) => 
+                            part.toLowerCase() === highlight.toLowerCase() ? 
+                                <span key={i} className="bg-yellow-200 dark:bg-yellow-900/50 text-slate-900 dark:text-slate-100 rounded-sm px-0.5">{part}</span> : 
+                                <span key={i}>{part}</span>
+                        )}
+                    </span>
+                );
+            } catch (e) {
+                return <span>{safeText}</span>;
+            }
+        });
+
+        const HighlightSql = React.memo(({ code, searchTerm }) => {
+            const keywords = /\b(SELECT|FROM|WHERE|CAST|AS|LEFT|JOIN|ON|CREATE|OR|REPLACE|VIEW|WITH|NO|SCHEMA|BINDING|GRANT|TO|GROUP|TRUE|FALSE|NULL|TABLE|DISTSTYLE|SORTKEY|DISTKEY|AUTO)\b/gi;
+            const types = /\b(VARCHAR|BIGINT|SMALLINT|INTEGER|DECIMAL|REAL|DOUBLE PRECISION|CHAR|TEXT|DATE|TIMESTAMP|TIMESTAMPTZ|BOOLEAN|SUPER|GEOMETRY|VARBYTE)\b/gi;
+
+            const lines = useMemo(() => code.split('\n'), [code]);
+
+            return (
+                <div className="font-mono text-xs leading-relaxed">
+                    {lines.map((line, i) => {
+                        if (line.trim().startsWith('--') || line.trim().startsWith('/*')) {
+                             return <div key={i} id={`sql-line-${i}`} className="text-slate-400 italic"><HighlightText text={line} highlight={searchTerm} /></div>;
+                        }
+                        const parts = line.split(/(".*?"|'.*?'|\b\w+\b|[(),.])/g).filter(Boolean);
+                        return (
+                            <div key={i} id={`sql-line-${i}`} className="whitespace-pre-wrap">
+                                <span className="text-slate-300 dark:text-slate-600 w-6 inline-block select-none text-right mr-3 text-[10px]">{i + 1}</span>
+                                {parts.map((part, j) => {
+                                    if (part.match(keywords)) {
+                                        return <span key={j} className="text-blue-600 dark:text-blue-400 font-bold"><HighlightText text={part} highlight={searchTerm} /></span>;
+                                    } else if (part.match(types)) {
+                                        return <span key={j} className="text-teal-600 dark:text-teal-400 font-bold"><HighlightText text={part} highlight={searchTerm} /></span>;
+                                    } else if (part.startsWith("'")) {
+                                        return <span key={j} className="text-green-600 dark:text-green-400"><HighlightText text={part} highlight={searchTerm} /></span>;
+                                    } else if (part.startsWith('"')) {
+                                        return <span key={j} className="text-orange-600 dark:text-orange-300"><HighlightText text={part} highlight={searchTerm} /></span>;
+                                    } else {
+                                        return <span key={j} className="text-slate-700 dark:text-slate-300"><HighlightText text={part} highlight={searchTerm} /></span>;
+                                    }
+                                })}
+                            </div>
+                        );
+                    })}
+                </div>
+            );
+        });
+
+        const FormattedField = React.memo(({ path, searchTerm }) => {
+          const parts = path.split('.');
+          return (
+            <span className="inline-flex flex-wrap items-baseline gap-0.5">
+              {parts.map((part, index) => {
+                const isArray = part.endsWith('[]');
+                const text = isArray ? part.slice(0, -2) : part;
+                return (
+                  <React.Fragment key={index}>
+                    {index > 0 && <span className="opacity-50">.</span>}
+                    {isArray ? (
+                      <span className="font-bold cursor-help border-b border-dotted border-slate-400" title="array">
+                        <HighlightText text={text} highlight={searchTerm} />
+                      </span>
+                    ) : (
+                      <span><HighlightText text={text} highlight={searchTerm} /></span>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </span>
+          );
+        });
+
+        const DataTypeSelect = React.memo(({ value, originalType, onChange }) => {
+          const [isOpen, setIsOpen] = useState(false);
+          const [isCustomMode, setIsCustomMode] = useState(false);
+          const [customLength, setCustomLength] = useState("");
+          const containerRef = useRef(null);
+          const menuRef = useRef(null); 
+          
+          const [coords, setCoords] = useState({ top: 0, left: 0, width: 0 });
+
+          useEffect(() => {
+            const handleClickOutside = (event) => {
+              if (
+                  containerRef.current && !containerRef.current.contains(event.target) &&
+                  (!menuRef.current || !menuRef.current.contains(event.target))
+              ) {
+                  setIsOpen(false);
+              }
+            };
+
+            const handleScroll = (event) => {
+                if (menuRef.current && menuRef.current.contains(event.target)) {
+                    return;
+                }
+                setIsOpen(false);
+            };
+
+            if (isOpen) {
+                document.addEventListener('mousedown', handleClickOutside);
+                window.addEventListener('scroll', handleScroll, true); 
+            }
+            return () => {
+                document.removeEventListener('mousedown', handleClickOutside);
+                window.removeEventListener('scroll', handleScroll, true);
+            };
+          }, [isOpen]);
+
+          const handleToggle = () => {
+            if (isCustomMode) return; 
+            if (!isOpen && containerRef.current) {
+                const rect = containerRef.current.getBoundingClientRect();
+                let top = rect.bottom;
+                if (window.innerHeight - rect.bottom < 300) {
+                    top = rect.top - 300; 
+                     if (top < 0) top = rect.bottom; 
+                }
+                setCoords({ top: rect.bottom, left: rect.left, width: rect.width });
+            }
+            setIsOpen(!isOpen);
+          };
+
+          const handleSelect = (newValue) => {
+            if (newValue === 'VARCHAR') {
+                setIsOpen(false);
+                setIsCustomMode(true);
+                const match = value && value.match(/VARCHAR\((\d+)\)/);
+                setCustomLength(match ? match[1] : "");
+            } else {
+                onChange(newValue);
+                setIsOpen(false);
+            }
+          };
+
+          const submitCustom = () => {
+              if (customLength && !isNaN(customLength)) onChange(`VARCHAR(${customLength})`);
+              setIsCustomMode(false);
+          };
+
+          return (
+            <div className="relative inline-block w-full max-w-[200px]" ref={containerRef}>
+              {isCustomMode ? (
+                  <div className="flex items-center text-sm md:text-xs font-mono bg-blue-50 dark:bg-blue-900/30 rounded px-2 py-1 border border-blue-300 dark:border-blue-700">
+                      <span className="text-blue-700 dark:text-blue-300">VARCHAR(</span>
+                      <input 
+                        type="number" autoFocus placeholder="256"
+                        className="w-12 px-0.5 py-0 bg-white dark:bg-slate-800 text-center border-b border-blue-400 outline-none text-blue-800 dark:text-blue-200"
+                        value={customLength}
+                        onChange={(e) => setCustomLength(e.target.value)}
+                        onBlur={submitCustom}
+                        onKeyDown={(e) => e.key === 'Enter' && submitCustom()}
+                      />
+                      <span className="text-blue-700 dark:text-blue-300">)</span>
+                  </div>
+              ) : (
+                <button 
+                    onClick={handleToggle}
+                    className="w-full flex items-center justify-between px-3 py-1 bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 rounded text-xs font-normal font-mono hover:bg-blue-200 dark:hover:bg-blue-800 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500/50 h-7"
+                >
+                    <span className="truncate">{value}</span>
+                    <ChevronDown size={14} className={`ml-2 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} />
+                </button>
+              )}
+              
+              {isOpen && (
+                <div 
+                    ref={menuRef}
+                    style={{ position: 'fixed', top: `${coords.top}px`, left: `${coords.left}px`, width: `${coords.width}px`, zIndex: 9999 }}
+                    className="mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl max-h-64 overflow-y-auto"
+                >
+                  {Object.entries(CATEGORIZED_TYPES).map(([category, types]) => (
+                    <div key={category}>
+                      <div className="px-3 py-2 text-[10px] font-semibold text-slate-400 uppercase tracking-wider bg-slate-50 dark:bg-slate-800/80 sticky top-0 backdrop-blur-sm">{category}</div>
+                      {types.map(t => (
+                          <button
+                            key={t}
+                            onClick={() => handleSelect(t)}
+                            className={`w-full text-left px-3 py-3 md:py-2 text-sm md:text-xs font-mono flex items-center justify-between hover:bg-slate-100 dark:hover:bg-slate-700/50 transition-colors ${t === value ? 'bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300' : 'text-slate-700 dark:text-slate-300'}`}
+                          >
+                            <div className="flex flex-col items-start gap-0.5">
+                                <span>{t}</span>
+                                {t === originalType && <span className="text-[10px] text-green-600 dark:text-green-400 font-sans font-medium whitespace-nowrap">(Default)</span>}
+                            </div>
+                            {t === value && <Check size={14} />}
+                          </button>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        });
+
+        const SortKeySelector = ({ availableColumns, value, onChange }) => {
+            const [inputValue, setInputValue] = useState("");
+            const [showSuggestions, setShowSuggestions] = useState(false);
+            const containerRef = useRef(null);
+
+            const selectedKeys = useMemo(() => {
+                return value ? value.split(',').map(k => k.trim()).filter(Boolean) : [];
+            }, [value]);
+
+            const filteredOptions = useMemo(() => {
+                const lowerInput = inputValue.toLowerCase();
+                return availableColumns.filter(col => 
+                    !selectedKeys.includes(col) && 
+                    col.toLowerCase().includes(lowerInput)
+                );
+            }, [availableColumns, selectedKeys, inputValue]);
+
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (containerRef.current && !containerRef.current.contains(event.target)) {
+                        setShowSuggestions(false);
+                    }
+                };
+                document.addEventListener("mousedown", handleClickOutside);
+                return () => document.removeEventListener("mousedown", handleClickOutside);
+            }, []);
+
+            const handleAdd = (col) => {
+                const newKeys = [...selectedKeys, col];
+                onChange(newKeys.join(', '));
+                setInputValue("");
+                setShowSuggestions(false); 
+            };
+
+            const handleRemove = (colToRemove) => {
+                const newKeys = selectedKeys.filter(col => col !== colToRemove);
+                onChange(newKeys.join(', '));
+            };
+            
+            const handleClearAll = (e) => {
+                e.stopPropagation();
+                onChange("");
+                setInputValue("");
+            };
+
+            const handleKeyDown = (e) => {
+                if (e.key === 'Backspace' && !inputValue && selectedKeys.length > 0) {
+                    handleRemove(selectedKeys[selectedKeys.length - 1]);
+                }
+            };
+
+            return (
+                <div className="relative w-full" ref={containerRef}>
+                    <div 
+                        className="flex flex-wrap items-center gap-1.5 p-1.5 pr-8 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus-within:ring-2 focus-within:ring-blue-500 cursor-text min-h-[34px] max-h-[68px] overflow-y-auto"
+                        onClick={() => containerRef.current?.querySelector('input')?.focus()}
+                    >
+                        {selectedKeys.map(key => (
+                            <span key={key} className="flex items-center gap-1 bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 px-1.5 py-0.5 rounded text-xs font-mono animate-in fade-in zoom-in duration-200">
+                                {key}
+                                <button 
+                                    onClick={(e) => { e.stopPropagation(); handleRemove(key); }} 
+                                    className="hover:text-blue-900 dark:hover:text-blue-100 p-0.5 rounded-full hover:bg-blue-200 dark:hover:bg-blue-800 transition-colors"
+                                >
+                                    <X size={10}/>
+                                </button>
+                            </span>
+                        ))}
+                        <input 
+                            type="text" 
+                            value={inputValue}
+                            onChange={e => { setInputValue(e.target.value); setShowSuggestions(true); }}
+                            onFocus={() => setShowSuggestions(true)}
+                            onKeyDown={handleKeyDown}
+                            placeholder={selectedKeys.length === 0 ? "Select sort columns..." : ""}
+                            className="flex-1 min-w-[80px] bg-transparent outline-none text-xs font-mono text-slate-700 dark:text-slate-300 h-5 placeholder:text-slate-400"
+                        />
+                    </div>
+                    
+                    {selectedKeys.length > 0 && (
+                        <button
+                            onClick={handleClearAll}
+                            className="absolute right-2 top-2.5 text-slate-400 hover:text-red-500 transition-colors z-10 p-0.5 rounded-full hover:bg-slate-100 dark:hover:bg-slate-800"
+                        >
+                            <X size={14} />
+                        </button>
+                    )}
+
+                    {showSuggestions && filteredOptions.length > 0 && (
+                        <div className="absolute top-full left-0 w-full mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl max-h-40 overflow-y-auto z-50">
+                            {filteredOptions.map(col => (
+                                <button 
+                                    key={col} 
+                                    onClick={() => handleAdd(col)}
+                                    className="w-full text-left px-3 py-1.5 text-xs font-mono hover:bg-slate-100 dark:hover:bg-slate-700/50 text-slate-700 dark:text-slate-300 block transition-colors"
+                                >
+                                    {col}
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const JsonPrimitive = React.memo(({ value, isLast, searchTerm }) => {
+          let type = typeof value;
+          let displayValue = String(value);
+          let colorClass = "text-slate-700 dark:text-slate-300"; // Default
+          let isTruncated = false;
+
+          if (value === null) {
+            type = "null"; displayValue = "null"; colorClass = "text-slate-400 dark:text-slate-500 italic";
+          } else if (type === "string") {
+            if (value.length > MAX_STRING_LENGTH && !searchTerm) { 
+              displayValue = `"${value.substring(0, MAX_STRING_LENGTH)}..."`;
+              isTruncated = true;
+            } else {
+              displayValue = `"${value}"`;
+            }
+            colorClass = "text-amber-600 dark:text-amber-400"; // Warm String Color
+          } else if (type === "number") colorClass = "text-emerald-600 dark:text-emerald-400"; // Green for Numbers
+          else if (type === "boolean") colorClass = "text-blue-600 dark:text-blue-400 font-semibold"; // Blue for Booleans
+
+          return (
+            <span className="font-mono text-sm group relative">
+              <span className={colorClass}>
+                {type === "string" && !isTruncated ? <>"<HighlightText text={value} highlight={searchTerm} />"</> : <HighlightText text={displayValue} highlight={searchTerm} />}
+              </span>
+              {!isLast && <span className="text-slate-400 dark:text-slate-500">,</span>}
+            </span>
+          );
+        });
+
+        const JsonNode = React.memo(({ name, value, isLast, depth = 0, expandSignal, searchTerm }) => {
+          const [isExpanded, setIsExpanded] = useState(false);
+          const [showAllItems, setShowAllItems] = useState(false);
+          const isObject = value !== null && typeof value === 'object';
+          const isArray = Array.isArray(value);
+          const isEmpty = isObject && Object.keys(value).length === 0;
+
+          const matchesSearch = useMemo(() => {
+              if (!searchTerm) return true;
+              const lowerSearch = searchTerm.toLowerCase();
+              if (name && name.toLowerCase().includes(lowerSearch)) return true;
+              if (!isObject && String(value).toLowerCase().includes(lowerSearch)) return true;
+              if (isObject) {
+                  const checkMatch = (val) => {
+                      if (val === null) return String(val).toLowerCase().includes(lowerSearch);
+                      if (typeof val !== 'object') return String(val).toLowerCase().includes(lowerSearch);
+                      return Object.entries(val).some(([k, v]) => k.toLowerCase().includes(lowerSearch) || checkMatch(v));
+                  };
+                  return checkMatch(value);
+              }
+              return false;
+          }, [name, value, isObject, searchTerm]);
+
+          useEffect(() => {
+            if (expandSignal) {
+              setIsExpanded(expandSignal.action === 'EXPAND');
+              if (expandSignal.action === 'COLLAPSE') setShowAllItems(false);
+            }
+          }, [expandSignal]);
+
+          useEffect(() => {
+              if (searchTerm && matchesSearch && isObject) setIsExpanded(true);
+          }, [searchTerm, matchesSearch, isObject]);
+
+          const handleToggle = (e) => { 
+              e.stopPropagation(); 
+              if (window.getSelection().toString().length > 0) return;
+              setIsExpanded(!isExpanded); 
+          };
+          
+          const handleKeyDown = (e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setIsExpanded(!isExpanded);
+              }
+          };
+
+          if (searchTerm && !matchesSearch) return null;
+
+          if (!isObject) {
+            return (
+              <div 
+                className="pl-4 hover:bg-gray-50 dark:hover:bg-slate-800/50 rounded flex items-start focus:outline-none focus:ring-1 focus:ring-blue-500/30 min-h-[32px] items-center"
+                tabIndex={0}
+              >
+                {name && <span className="text-sky-700 dark:text-sky-300 font-medium mr-1">"<HighlightText text={name} highlight={searchTerm} />":</span>}
+                <JsonPrimitive value={value} isLast={isLast} searchTerm={searchTerm} />
+              </div>
+            );
+          }
+
+          const keys = Object.keys(value);
+          const openBracket = isArray ? '[' : '{';
+          const closeBracket = isArray ? ']' : '}';
+          const itemCount = keys.length;
+          const shouldTruncate = !showAllItems && itemCount > MAX_ITEMS_PREVIEW && !searchTerm; 
+          const displayKeys = shouldTruncate ? keys.slice(0, MAX_ITEMS_PREVIEW) : keys;
+
+          return (
+            <div className="font-mono text-sm">
+              <div 
+                className={`flex items-center cursor-pointer hover:bg-gray-50 dark:hover:bg-slate-800/50 rounded ${depth > 0 ? 'pl-4' : ''} focus:outline-none focus:ring-1 focus:ring-blue-500/30 min-h-[32px]`}
+                onClick={handleToggle}
+                onKeyDown={handleKeyDown}
+                tabIndex={0}
+                role="button"
+                aria-expanded={isExpanded}
+              >
+                <span className="w-4 h-4 mr-1 text-slate-400 flex items-center justify-center">
+                  {!isEmpty && (isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />)}
+                </span>
+                {name && <span className="text-purple-700 dark:text-purple-400 font-bold mr-1">"<HighlightText text={name} highlight={searchTerm} />":</span>}
+                <span className="text-slate-600 dark:text-slate-300">
+                  {openBracket}
+                  {!isExpanded && !isEmpty && <span className="text-slate-400 text-xs ml-2 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded-full">{itemCount} {itemCount === 1 ? 'item' : 'items'}</span>}
+                </span>
+                {!isExpanded && <span><span className="text-slate-600 dark:text-slate-300">{closeBracket}</span>{!isLast && <span className="text-slate-400 dark:text-slate-500">,</span>}</span>}
+              </div>
+
+              {isExpanded && !isEmpty && (
+                <div className="pl-4 border-l border-slate-200 dark:border-slate-700 ml-2">
+                  {displayKeys.map((key, index) => (
+                    <JsonNode
+                      key={key}
+                      name={isArray ? null : key}
+                      value={value[key]}
+                      isLast={index === keys.length - 1 && !shouldTruncate} 
+                      depth={depth + 1}
+                      expandSignal={expandSignal}
+                      searchTerm={searchTerm}
+                    />
+                  ))}
+                  {shouldTruncate && (
+                    <div className="pl-4 py-1">
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); setShowAllItems(true); }}
+                        className="flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-blue-600 dark:hover:text-blue-400 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 px-2 py-1 rounded transition-colors"
+                      >
+                        <MoreHorizontal size={14} /> Show {itemCount - MAX_ITEMS_PREVIEW} more items...
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+              {isExpanded && <div className={`pl-4 ${depth > 0 ? 'pl-4' : ''}`}><span className="text-gray-600 dark:text-gray-300">{closeBracket}</span>{!isLast && <span className="text-slate-400 dark:text-slate-500">,</span>}</div>}
+            </div>
+          );
+        });
+
+        // --- Data Preview Component (Virtualized) ---
+        const DataPreview = ({ data, columns }) => {
+            const parentRef = useRef(null);
+            const [scrollTop, setScrollTop] = useState(0);
+            const [containerHeight, setContainerHeight] = useState(0);
+
+            useEffect(() => {
+                if (!parentRef.current) return;
+                const resizeObserver = new ResizeObserver(entries => {
+                    for (let entry of entries) {
+                        setContainerHeight(entry.contentRect.height);
+                    }
+                });
+                resizeObserver.observe(parentRef.current);
+                return () => resizeObserver.disconnect();
+            }, []);
+
+            const handleScroll = (e) => {
+                const target = e.target;
+                if (window.requestAnimationFrame) {
+                    requestAnimationFrame(() => {
+                        setScrollTop(target.scrollTop);
+                    });
+                } else {
+                    setScrollTop(target.scrollTop);
+                }
+            };
+
+            if (!data || data.length === 0) return <div className="p-8 text-center text-slate-400">No data available. Check your schema selection.</div>;
+
+            const rowHeight = 35; // Fixed height for rows
+            const headerHeight = 40; // Height of the sticky header
+            
+            // Render first few rows immediately even if containerHeight is 0 to avoid blank screen
+            const effectiveHeight = containerHeight || 500;
+            
+            const totalRows = data.length;
+            const visibleRows = Math.ceil(effectiveHeight / rowHeight);
+            
+            // Account for header height in scroll position
+            const scrollOffset = Math.max(0, scrollTop - headerHeight);
+            const startIndex = Math.max(0, Math.floor(scrollOffset / rowHeight) - 2); // Buffer
+            const endIndex = Math.min(totalRows, startIndex + visibleRows + 20); // Increased Buffer
+
+            const visibleData = data.slice(startIndex, endIndex);
+            const topSpacerHeight = startIndex * rowHeight;
+            const bottomSpacerHeight = Math.max(0, (totalRows - endIndex) * rowHeight);
+
+            return (
+                <div 
+                    ref={parentRef} 
+                    className="w-full h-full overflow-auto bg-white dark:bg-slate-900 relative virtual-list-container"
+                    onScroll={handleScroll}
+                >
+                    <table className="min-w-full border-collapse text-left whitespace-nowrap">
+                        <thead className="bg-slate-100 dark:bg-slate-800 sticky top-0 z-10 shadow-sm h-[40px]">
+                            <tr>
+                                <th className="p-3 text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 w-16 text-center">#</th>
+                                {columns.map((col, idx) => (
+                                    <th key={idx} className="p-3 text-xs font-semibold text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-600 bg-slate-100 dark:bg-slate-800 min-w-[150px]">
+                                        {col}
+                                    </th>
+                                ))}
+                            </tr>
+                        </thead>
+                        <tbody className="bg-white dark:bg-slate-900">
+                            {topSpacerHeight > 0 && (
+                                <tr>
+                                    <td colSpan={columns.length + 1} style={{ height: topSpacerHeight, padding: 0, border: 0 }}></td>
+                                </tr>
+                            )}
+                            {visibleData.map((row, i) => {
+                                const rowIndex = startIndex + i;
+                                const isEven = rowIndex % 2 === 0;
+                                return (
+                                    <tr key={rowIndex} className={`hover:bg-blue-50 dark:hover:bg-slate-800/50 transition-colors h-[35px] ${isEven ? 'bg-white dark:bg-slate-900' : 'bg-slate-50 dark:bg-slate-800/30'}`}>
+                                        <td className="p-2 text-xs text-slate-500 font-mono text-center border border-slate-300 dark:border-slate-600 bg-slate-100/50 dark:bg-slate-800/50 truncate">{rowIndex + 1}</td>
+                                        {columns.map((col, j) => (
+                                            <td key={j} className="p-2 text-xs font-mono text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-600 min-w-[150px] max-w-xs truncate" title={String(row[col])}>
+                                                {row[col] === null ? <span className="text-slate-400 italic">null</span> : String(row[col])}
+                                            </td>
+                                        ))}
+                                    </tr>
+                                );
+                            })}
+                            {bottomSpacerHeight > 0 && (
+                                <tr>
+                                    <td colSpan={columns.length + 1} style={{ height: bottomSpacerHeight, padding: 0, border: 0 }}></td>
+                                </tr>
+                            )}
+                        </tbody>
+                    </table>
+                </div>
+            );
+        };
+
+        const buildSchemaTree = (flatSchema) => {
+            const root = { name: 'root', children: {}, items: [] };
+            flatSchema.forEach(item => {
+                const pathParts = item.field.split('.');
+                let currentNode = root;
+                for (let i = 0; i < pathParts.length; i++) {
+                    const part = pathParts[i];
+                    const isLeaf = i === pathParts.length - 1;
+                    const displayName = part.replace('[]', '');
+                    const isArray = part.endsWith('[]');
+                    if (isLeaf) {
+                        currentNode.items.push({ ...item, displayName, isArray });
+                    } else {
+                        if (!currentNode.children[displayName]) {
+                            currentNode.children[displayName] = { name: displayName, children: {}, items: [], isArray: isArray, path: pathParts.slice(0, i+1).join('.') };
+                        }
+                        currentNode = currentNode.children[displayName];
+                    }
+                }
+            });
+            return root;
+        };
+
+        const collectNodeFields = (node) => {
+            let fields = [];
+            if (node.items) node.items.forEach(i => fields.push(i.field));
+            if (node.children) Object.values(node.children).forEach(child => fields.push(...collectNodeFields(child)));
+            return fields;
+        };
+
+        // --- Optimized SchemaView with Virtualization ---
+        const SchemaRow = React.memo(({ item, type, depth, onTypeChange, searchTerm, onSelect, isSelected, columnAliases, onColumnAliasChange, isExcluded, onToggle, isExpanded, selectionState, effectiveAliases }) => {
+            const currentAlias = columnAliases[item.field || item.path] || "";
+            const isNode = type === 'node';
+            
+            // Only leaves have selection and type change
+            const canSelect = !isNode;
+            
+            // Indentation
+            const paddingLeft = depth * 20 + 8;
+            
+            const handleSelectChange = () => {
+                if (isNode) {
+                    const fields = collectNodeFields(item);
+                    // Toggle: if currently fully selected (all), deselect all. Otherwise select all.
+                    onSelect(fields, selectionState !== 'all'); 
+                } else {
+                    onSelect([item.field], !isSelected);
+                }
+            };
+
+            const placeholder = isNode ? "" : (effectiveAliases[item.field] || "Alias");
+            
+            return (
+                <div 
+                    className={`flex items-center border-b border-slate-100 dark:border-slate-800 h-[35px] hover:bg-slate-50 dark:hover:bg-slate-800/30 transition-colors group ${isSelected || (isNode && selectionState === 'all') ? 'bg-blue-50/50 dark:bg-blue-900/20' : ''} ${isExcluded ? 'opacity-40 grayscale decoration-slate-400' : ''}`}
+                >
+                    {/* Checkbox Column */}
+                    <div className="w-10 flex-shrink-0 flex items-center justify-center border-r border-slate-100 dark:border-slate-800 h-full bg-slate-50/30 dark:bg-slate-800/10">
+                         <div 
+                            className="w-4 h-4 rounded border border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700 cursor-pointer flex items-center justify-center bg-white dark:bg-gray-800 transition-colors hover:border-blue-400"
+                            onClick={handleSelectChange}
+                         >
+                            {isNode ? (
+                                selectionState === 'all' ? <Check size={12} className="text-blue-600 dark:text-blue-400" /> : 
+                                selectionState === 'partial' ? <Minus size={12} className="text-blue-600 dark:text-blue-400" /> : null
+                            ) : (
+                                isSelected && <Check size={12} className="text-blue-600 dark:text-blue-400" />
+                            )}
+                         </div>
+                    </div>
+
+                    {/* Field Name Column */}
+                    <div className="flex-1 flex items-center h-full min-w-[200px] overflow-hidden px-2 relative">
+                         {/* Guide lines */}
+                         {Array.from({ length: depth }).map((_, i) => (
+                            <div 
+                                key={i} 
+                                className="absolute top-0 bottom-0 border-l border-slate-200 dark:border-slate-700/60"
+                                style={{ left: `${i * 20 + 20}px` }} 
+                            />
+                        ))}
+                        
+                        <div style={{ paddingLeft: `${depth * 20}px` }} className="flex items-center gap-2 pl-2 w-full">
+                            {isNode ? (
+                                <div 
+                                    className="flex items-center gap-2 cursor-pointer select-none group/toggle text-slate-700 dark:text-slate-200 font-semibold text-sm hover:text-blue-600 dark:hover:text-blue-400"
+                                    onClick={() => onToggle(item.path)}
+                                >
+                                    <span className="w-5 h-5 flex items-center justify-center text-slate-400">
+                                        {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                    </span>
+                                    <span className="flex items-center gap-1.5 truncate">
+                                        {/* Folder Icons Removed as requested */}
+                                        <HighlightText text={item.name} highlight={searchTerm} />
+                                    </span>
+                                </div>
+                            ) : (
+                                <div className="flex items-center gap-2 text-sm font-mono text-purple-700 dark:text-purple-400 truncate pl-6 relative">
+                                     <span className="text-slate-300 dark:text-slate-600 absolute left-1 top-1/2 -translate-y-1/2">└</span>
+                                     <FormattedField path={item.displayName || item.field} searchTerm={searchTerm} />
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Type Column */}
+                    <div className="w-[15%] min-w-[120px] flex items-center px-2 h-full">
+                        {isNode ? (
+                            item.isArray && <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">Array</span>
+                        ) : (
+                            <div className={`w-full ${isSelected || isExcluded ? 'opacity-30 pointer-events-none' : ''}`}>
+                                <DataTypeSelect value={item.type} originalType={item.originalType} onChange={(newType) => onTypeChange(item.field, newType)} />
+                            </div>
+                        )}
+                    </div>
+                    
+                    {/* Alias Column */}
+                    <div className="w-[25%] min-w-[150px] flex items-center px-2 h-full">
+                         {!isNode && (
+                            <input 
+                                type="text" 
+                                placeholder={placeholder} // Use passed effective alias
+                                value={currentAlias}
+                                disabled={isExcluded}
+                                onFocus={(e) => {
+                                    if (!currentAlias) {
+                                         onColumnAliasChange({...columnAliases, [item.field]: placeholder});
+                                    }
+                                }}
+                                onChange={(e) => onColumnAliasChange({...columnAliases, [item.field]: e.target.value})}
+                                className="w-full px-2 py-1 text-sm md:text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded focus:ring-2 focus:ring-blue-500 outline-none text-blue-700 dark:text-blue-300 font-mono placeholder:text-slate-400 disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed h-[26px]"
+                            />
+                         )}
+                    </div>
+                    
+                    {/* Sample Column */}
+                    <div className="w-[20%] min-w-[150px] flex items-center px-2 h-full text-xs text-slate-500 font-mono truncate border-l border-slate-100 dark:border-slate-800">
+                        {!isNode && JSON.stringify(item.sample)}
+                    </div>
+                </div>
+            );
+        });
+
+        const SchemaView = ({ schema, onTypeChange, searchTerm, expandSignal, columnAliases, onColumnAliasChange, effectiveAliases, excludedFields, selectedFields, onSelect, onSelectAll }) => {
+            const [expandedPaths, setExpandedPaths] = useState(new Set(['root']));
+            const parentRef = useRef(null);
+            const [scrollTop, setScrollTop] = useState(0);
+            const [containerHeight, setContainerHeight] = useState(0);
+
+            useEffect(() => {
+                if (!parentRef.current) return;
+                const resizeObserver = new ResizeObserver(entries => {
+                    for (let entry of entries) {
+                        setContainerHeight(entry.contentRect.height);
+                    }
+                });
+                resizeObserver.observe(parentRef.current);
+                return () => resizeObserver.disconnect();
+            }, []);
+
+            const handleScroll = (e) => {
+                const target = e.target;
+                if (window.requestAnimationFrame) {
+                    requestAnimationFrame(() => {
+                        setScrollTop(target.scrollTop);
+                    });
+                } else {
+                    setScrollTop(target.scrollTop);
+                }
+            };
+
+            const toggleNode = useCallback((path) => {
+                setExpandedPaths(prev => {
+                    const next = new Set(prev);
+                    if (next.has(path)) next.delete(path);
+                    else next.add(path);
+                    return next;
+                });
+            }, []);
+
+            useEffect(() => {
+                if (expandSignal) {
+                    if (expandSignal.action === 'EXPAND') {
+                        const allPaths = new Set();
+                        const traverse = (node) => {
+                            if (node.path) allPaths.add(node.path);
+                            Object.values(node.children).forEach(traverse);
+                        };
+                        traverse(buildSchemaTree(schema)); 
+                        setExpandedPaths(allPaths);
+                    } else {
+                        setExpandedPaths(new Set(['root']));
+                    }
+                }
+            }, [expandSignal, schema]);
+
+            const flatRows = useMemo(() => {
+                if (!schema) return [];
+                const treeRoot = buildSchemaTree(schema);
+                const rows = [];
+                
+                const flatten = (node, depth) => {
+                    if (node.name !== 'root') {
+                         rows.push({ type: 'node', data: node, depth });
+                    }
+                    
+                    if (node.name === 'root' || expandedPaths.has(node.path) || searchTerm) {
+                         node.items.forEach(item => {
+                             // Inject effective alias into item data for row to use
+                             const itemWithAlias = { ...item, effectiveAlias: effectiveAliases[item.field] };
+                             // Check search filter for items
+                             if (!searchTerm || item.field.toLowerCase().includes(searchTerm.toLowerCase()) || item.type.toLowerCase().includes(searchTerm.toLowerCase())) {
+                                 rows.push({ type: 'leaf', data: itemWithAlias, depth: node.name === 'root' ? 0 : depth + 1 });
+                             }
+                         });
+                         Object.values(node.children).forEach(child => {
+                             flatten(child, node.name === 'root' ? 0 : depth + 1);
+                         });
+                    }
+                };
+                
+                flatten(treeRoot, 0);
+                return rows;
+            }, [schema, expandedPaths, searchTerm, effectiveAliases]);
+
+            if (!schema) return <div className="text-gray-500 p-4">No data to analyze.</div>;
+
+            const rowHeight = 35;
+            const effectiveHeight = containerHeight || 500;
+            const totalRows = flatRows.length;
+            const visibleRowCount = Math.ceil(effectiveHeight / rowHeight);
+            
+            const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - 5);
+            const endIndex = Math.min(totalRows, startIndex + visibleRowCount + 10);
+            
+            const visibleRows = flatRows.slice(startIndex, endIndex);
+            const topSpacerHeight = startIndex * rowHeight;
+            // Fix bottom spacer calc to avoid negative
+            const bottomSpacerHeight = Math.max(0, (totalRows - endIndex) * rowHeight);
+
+            const areAllFilteredSelected = flatRows.filter(r => r.type === 'leaf').every(r => selectedFields.has(r.data.field));
+
+            const handleSelectAllFiltered = (e) => {
+                const leafItems = flatRows.filter(r => r.type === 'leaf').map(r => r.data);
+                onSelectAll(leafItems, e.target.checked);
+            };
+
+            // Helper to calculate node selection state for the row
+            const getNodeSelectionState = (node) => {
+                const fields = collectNodeFields(node);
+                if (fields.length === 0) return 'none';
+                const allSelected = fields.every(f => selectedFields.has(f));
+                if (allSelected) return 'all';
+                const someSelected = fields.some(f => selectedFields.has(f));
+                return someSelected ? 'partial' : 'none';
+            };
+
+            return (
+                <div className="flex flex-col h-full">
+                    {/* Header */}
+                    <div className="flex-none bg-slate-50 dark:bg-slate-800/50 text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-slate-700 h-[40px] flex items-center text-xs font-semibold">
+                         <div className="w-10 text-center border-r border-slate-200 dark:border-slate-700 h-full flex items-center justify-center">
+                            <input type="checkbox" onChange={handleSelectAllFiltered} checked={areAllFilteredSelected} className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700 cursor-pointer" />
+                         </div>
+                         {/* Removed empty div here */}
+                         <div className="flex-1 px-2 uppercase tracking-wider">Field Name</div>
+                         <div className="w-[15%] min-w-[120px] px-2 uppercase tracking-wider">Type</div>
+                         <div className="w-[25%] min-w-[150px] px-2 uppercase tracking-wider">Column name</div>
+                         <div className="w-[20%] min-w-[150px] px-2 uppercase tracking-wider">Sample</div>
+                    </div>
+                    
+                    {/* Virtualized Body */}
+                    <div 
+                        ref={parentRef}
+                        className="flex-1 overflow-auto bg-white dark:bg-slate-900 virtual-list-container"
+                        onScroll={handleScroll}
+                    >
+                         <div style={{ height: totalRows * rowHeight, position: 'relative' }}>
+                             <div style={{ position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${topSpacerHeight}px)` }}>
+                                {visibleRows.map((row, i) => (
+                                    <SchemaRow 
+                                        key={row.type === 'node' ? row.data.path : row.data.field}
+                                        item={row.data}
+                                        type={row.type}
+                                        depth={row.depth}
+                                        onTypeChange={onTypeChange}
+                                        searchTerm={searchTerm}
+                                        onSelect={onSelect}
+                                        selectedFields={selectedFields}
+                                        columnAliases={columnAliases}
+                                        onColumnAliasChange={onColumnAliasChange}
+                                        effectiveAliases={effectiveAliases}
+                                        isExcluded={excludedFields.has(row.data.field)}
+                                        isExpanded={row.type === 'node' ? expandedPaths.has(row.data.path) : false}
+                                        onToggle={toggleNode}
+                                        selectionState={row.type === 'node' ? getNodeSelectionState(row.data) : (selectedFields.has(row.data.field) ? 'all' : 'none')}
+                                        isSelected={row.type === 'leaf' && selectedFields.has(row.data.field)}
+                                    />
+                                ))}
+                             </div>
+                         </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const ScriptView = ({ schema, columnAliases, onColumnAliasChange, searchTerm, effectiveAliases }) => {
+            const [sqlScript, setSqlScript] = useState('');
+            const [scriptMode, setScriptMode] = useState('view'); 
+            const [copied, setCopied] = useState(false);
+            const [showSettings, setShowSettings] = useState(true); 
+            const sqlViewRef = useRef(null);
+            const [config, setConfig] = useState({ 
+                sourceTable: "raw_data.source_table", 
+                viewName: "schema.vw_data", 
+                tableName: "schema.table_name", 
+                jsonColumn: "data", 
+                diststyle: "AUTO", 
+                sortKeys: "" 
+            });
+
+            const availableColumns = useMemo(() => Object.values(effectiveAliases), [effectiveAliases]);
+
+            useEffect(() => { 
+                if(schema) {
+                    if (scriptMode === 'view') {
+                        setSqlScript(generateSqlScript(schema, {}, columnAliases, config));
+                    } else {
+                        setSqlScript(generateTableDDL(schema, columnAliases, config));
+                    }
+                } 
+            }, [schema, columnAliases, config, scriptMode]);
+
+            const handleCopy = () => {
+                const textArea = document.createElement("textarea");
+                textArea.value = sqlScript;
+                textArea.style.position = "fixed";
+                textArea.style.left = "-9999px";
+                textArea.style.top = "0";
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                
+                try {
+                    document.execCommand('copy');
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 2000);
+                } catch (err) {
+                    console.error('Failed to copy text', err);
+                }
+                document.body.removeChild(textArea);
+            };
+
+            const handleDownload = () => {
+                const element = document.createElement("a");
+                const file = new Blob([sqlScript], {type: 'text/plain'});
+                element.href = URL.createObjectURL(file);
+                
+                let filename = "";
+                if (scriptMode === 'view') {
+                    const isDefault = config.viewName === "<schema.view_name>" || !config.viewName || !config.viewName.trim();
+                    filename = isDefault ? "view_ddl.sql" : `${config.viewName.replace(/["<>]/g, '').trim()}.sql`; 
+                } else {
+                    const isDefault = config.tableName === "<schema.table_name>" || !config.tableName || !config.tableName.trim();
+                    filename = isDefault ? "table_ddl.sql" : `${config.tableName.replace(/["<>]/g, '').trim()}.sql`;
+                }
+
+                element.download = filename;
+                document.body.appendChild(element);
+                element.click();
+                document.body.removeChild(element);
+            };
+
+            return (
+                <div className="flex flex-col h-full relative">
+                    <div className="flex items-center justify-between p-3 border-b border-slate-100 dark:border-slate-700/50 bg-white dark:bg-slate-800 relative z-20">
+                        <div className="flex items-center gap-3">
+                            <div className="relative">
+                                <Tooltip content={showSettings ? 'Hide configuration' : 'Show configuration'} position="bottom">
+                                    <button 
+                                        onClick={() => setShowSettings(!showSettings)} 
+                                        className={`flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-t-md transition-all border ${showSettings ? 'bg-slate-50/80 border-slate-200 border-b-transparent text-blue-700 dark:bg-slate-800/90 dark:border-slate-700 dark:border-b-transparent dark:text-blue-300 backdrop-blur-sm' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-700 rounded-md'}`}
+                                        style={{ marginBottom: showSettings ? '-1px' : '0' }}
+                                    >
+                                        <Settings size={14} /> Config
+                                    </button>
+                                </Tooltip>
+                            </div>
+                            
+                            <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-700 p-1 rounded-lg ml-2">
+                                <button 
+                                    onClick={() => setScriptMode('view')}
+                                    className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-all ${scriptMode === 'view' ? 'bg-white dark:bg-slate-600 text-blue-600 dark:text-white shadow-sm' : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'}`}
+                                >
+                                    View Script
+                                </button>
+                                <button 
+                                    onClick={() => setScriptMode('ddl')}
+                                    className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-all ${scriptMode === 'ddl' ? 'bg-white dark:bg-slate-600 text-blue-600 dark:text-white shadow-sm' : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'}`}
+                                >
+                                    Table DDL
+                                </button>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <Tooltip content="Download SQL file" position="bottom">
+                                <button onClick={handleDownload} className="flex items-center gap-2 px-3 py-1.5 bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 dark:bg-green-900/20 dark:text-green-400 dark:border-green-800 dark:hover:bg-green-900/30 rounded text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                                    <Download size={14} />
+                                </button>
+                            </Tooltip>
+                            <Tooltip content={copied ? 'Copied!' : 'Copy to clipboard'} position="bottom">
+                                <button onClick={handleCopy} className="flex items-center gap-2 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-600 dark:text-slate-300 rounded text-xs font-medium transition-colors">
+                                    {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} />} {copied ? 'Copied' : 'Copy'}
+                                </button>
+                            </Tooltip>
+                        </div>
+                    </div>
+                    {showSettings && (
+                        <div className="bg-slate-50 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 p-0 animate-in fade-in slide-in-from-top-2 relative z-10 shadow-sm">
+                            <div className="absolute top-0 left-[22px] -translate-y-[50%] w-3 h-3 bg-slate-50 dark:bg-slate-800 border-l border-t border-slate-200 dark:border-slate-700 rotate-45 z-20"></div>
+                            <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                {scriptMode === 'view' && (
+                                    <>
+                                        <div><label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Source Table</label><input type="text" value={config.sourceTable} onChange={(e) => setConfig({...config, sourceTable: e.target.value})} className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono" /></div>
+                                        <div><label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">JSON Column Name</label><input type="text" value={config.jsonColumn} onChange={(e) => setConfig({...config, jsonColumn: e.target.value})} className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono" /></div>
+                                    </>
+                                )}
+                                <div>
+                                    <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
+                                        {scriptMode === 'view' ? 'Target View Name' : 'Target Table Name'}
+                                    </label>
+                                    <input 
+                                        type="text" 
+                                        value={scriptMode === 'view' ? config.viewName : config.tableName} 
+                                        onChange={(e) => setConfig({
+                                            ...config, 
+                                            [scriptMode === 'view' ? 'viewName' : 'tableName']: e.target.value
+                                        })} 
+                                        className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono" 
+                                    />
+                                </div>
+                                {scriptMode === 'ddl' && (
+                                    <>
+                                        <div>
+                                            <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Diststyle</label>
+                                            <select 
+                                                value={config.diststyle} 
+                                                onChange={(e) => setConfig({...config, diststyle: e.target.value})}
+                                                className="w-32 px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono"
+                                            >
+                                                <option value="AUTO">AUTO</option>
+                                                <option value="EVEN">EVEN</option>
+                                                <option value="KEY">KEY</option>
+                                                <option value="ALL">ALL</option>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Sort Keys</label>
+                                            <SortKeySelector 
+                                                availableColumns={availableColumns}
+                                                value={config.sortKeys}
+                                                onChange={(newVal) => setConfig({...config, sortKeys: newVal})}
+                                            />
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                    <div className="relative flex-1 overflow-hidden" ref={sqlViewRef}>
+                        <pre className="h-full p-4 bg-slate-50 dark:bg-slate-900 text-slate-700 dark:text-slate-300 font-mono text-xs leading-relaxed overflow-auto whitespace-pre-wrap">
+                            <HighlightSql code={sqlScript} searchTerm={searchTerm} />
+                        </pre>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Main Application Component ---
+
+        function App() {
+          const [json, setJson] = useState(null);
+          const [fileInfo, setFileInfo] = useState(null);
+          const [error, setError] = useState(null);
+          const [isDragging, setIsDragging] = useState(false);
+          const [loading, setLoading] = useState(false);
+          const [loadingProgress, setLoadingProgress] = useState({ status: '', percent: 0 });
+          
+          const [isArrayMode, setIsArrayMode] = useState(false);
+          const [currentPage, setCurrentPage] = useState(0);
+          const [totalPages, setTotalPages] = useState(0);
+          const [expandSignal, setExpandSignal] = useState(null);
+          const [schemaExpandSignal, setSchemaExpandSignal] = useState(null);
+          
+          const [schemaData, setSchemaData] = useState(null);
+          const [tableAliases, setTableAliases] = useState({}); 
+          const [columnAliases, setColumnAliases] = useState({});
+          const [excludedFields, setExcludedFields] = useState(new Set()); 
+          const [selectedFields, setSelectedFields] = useState(new Set());
+          const [searchTerm, setSearchTerm] = useState(''); 
+          const [isDarkMode, setIsDarkMode] = useState(false); 
+          const [viewMode, setViewMode] = useState('tree');
+          const [useSampling, setUseSampling] = useState(true); 
+          const [flattenedData, setFlattenedData] = useState(null);
+          const [previewMode, setPreviewMode] = useState('json');
+          const [previewLimit, setPreviewLimit] = useState(true); // Toggle state: true = 100 limit, false = 5000 limit
+          const [totalRecords, setTotalRecords] = useState(null);
+
+          const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(true); 
+
+          const debouncedSearchTerm = useDebounce(searchTerm, 300);
+          const fileInputRef = useRef(null);
+          
+          const activeSchema = useMemo(() => {
+              if (!schemaData) return null;
+              if (excludedFields.size === 0) return schemaData;
+              return schemaData.filter(item => !excludedFields.has(item.field));
+          }, [schemaData, excludedFields]);
+
+          const effectiveAliases = useMemo(() => generateUniqueAliases(activeSchema, columnAliases), [activeSchema, columnAliases]);
+
+          const allSelectedAreExcluded = useMemo(() => {
+              const selectedCount = selectedFields.size;
+              return selectedCount > 0 && Array.from(selectedFields).every(f => excludedFields.has(f));
+          }, [selectedFields, excludedFields]);
+
+          useEffect(() => {
+            if (isDarkMode) document.documentElement.classList.add('dark');
+            else document.documentElement.classList.remove('dark');
+          }, [isDarkMode]);
+          
+          const toggleDarkMode = () => setIsDarkMode(!isDarkMode);
+
+          const handleSelect = useCallback((fieldPaths, isSelected) => {
+              setSelectedFields(prev => {
+                  const newSelected = new Set(prev);
+                  fieldPaths.forEach(path => isSelected ? newSelected.add(path) : newSelected.delete(path));
+                  return newSelected;
+              });
+          }, []);
+
+          const handleSelectAll = useCallback((items, isSelected) => {
+             if (isSelected) {
+                 setSelectedFields(prev => { 
+                     const newSelected = new Set(prev); 
+                     items.forEach(item => newSelected.add(item.field)); 
+                     return newSelected; 
+                 });
+             } else {
+                 setSelectedFields(prev => { 
+                     const newSelected = new Set(prev); 
+                     items.forEach(item => newSelected.delete(item.field)); 
+                     return newSelected; 
+                 });
+             }
+          }, []);
+
+          const handleBulkExcludeAction = useCallback((exclude = true) => {
+              setExcludedFields(prev => {
+                  const next = new Set(prev);
+                  selectedFields.forEach(path => exclude ? next.add(path) : next.delete(path));
+                  return next;
+              });
+              setSelectedFields(new Set());
+          }, [selectedFields]);
+
+          const handleBulkSchemaTypeChange = useCallback((newType) => {
+              setSchemaData(prev => prev.map(item => selectedFields.has(item.field) ? { ...item, type: newType } : item));
+              setSelectedFields(new Set());
+          }, [selectedFields]);
+
+          // Trigger worker to flatten data when switching to data view or when schema/json updates
+          const updateFlattenedPreview = useCallback(() => {
+              if (viewMode !== 'tree' || previewMode !== 'table' || !json || !activeSchema) return;
+              
+              setLoading(true);
+              setLoadingProgress({ status: 'Generating Preview...', percent: 50 });
+              
+              const worker = createWorker();
+              worker.postMessage({
+                  type: 'FLATTEN_DATA',
+                  payload: {
+                      json: isArrayMode ? json : [json],
+                      schema: activeSchema,
+                      aliases: effectiveAliases,
+                      limit: previewLimit ? 100 : 5000 // Send limit to worker
+                  }
+              });
+              
+              // Calculate total rows in separate message
+              worker.postMessage({
+                  type: 'CALC_TOTAL_ROWS',
+                  payload: {
+                      json: isArrayMode ? json : [json],
+                      schema: activeSchema
+                  }
+              });
+
+              worker.onmessage = (e) => {
+                  const { type, payload } = e.data;
+                  if (type === 'FLATTEN_SUCCESS') {
+                      setFlattenedData(payload);
+                      // Don't terminate yet, wait for total count
+                  } else if (type === 'TOTAL_ROWS_SUCCESS') {
+                      setTotalRecords(payload);
+                      setLoading(false);
+                      worker.terminate();
+                  } else if (type === 'ERROR') {
+                      setError(payload);
+                      setLoading(false);
+                      worker.terminate();
+                  }
+              };
+          }, [viewMode, previewMode, json, activeSchema, effectiveAliases, isArrayMode, previewLimit]);
+
+          // Trigger update on view change or dependency change (debounced/effect)
+          useEffect(() => {
+              if (viewMode === 'tree' && previewMode === 'table') {
+                  const timeout = setTimeout(updateFlattenedPreview, 500); // Debounce slightly
+                  return () => clearTimeout(timeout);
+              }
+          }, [updateFlattenedPreview, viewMode, previewMode]); // previewLimit change triggers updateFlattenedPreview which triggers this
+
+          const handleDownloadCSV = () => {
+            if (!flattenedData || flattenedData.length === 0) return;
+            
+            // Get headers from effectiveAliases (provides consistent order if possible, or just keys)
+            const headers = Object.values(effectiveAliases); 
+            // The worker constructs rows using these alias values as keys.
+            
+            const csvContent = [
+                headers.join(','),
+                ...flattenedData.map(row => 
+                    headers.map(header => {
+                        const val = row[header];
+                        if (val === null || val === undefined) return '';
+                        const str = String(val);
+                        // Escape quotes and wrap in quotes if necessary (standard CSV)
+                        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+                            return `"${str.replace(/"/g, '""')}"`;
+                        }
+                        return str;
+                    }).join(',')
+                )
+            ].join('\n');
+            
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            const url = URL.createObjectURL(blob);
+            link.setAttribute("href", url);
+            const fileName = fileInfo?.name ? fileInfo.name.replace(/\.json$/i, '') + '.csv' : 'data.csv';
+            link.setAttribute("download", fileName);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        };
+        
+        const handleExpandAll = () => viewMode === 'tree' ? setExpandSignal({ action: 'EXPAND', id: Date.now() }) : setSchemaExpandSignal({ action: 'EXPAND', id: Date.now() });
+        const handleCollapseAll = () => viewMode === 'tree' ? setExpandSignal({ action: 'COLLAPSE', id: Date.now() }) : setSchemaExpandSignal({ action: 'COLLAPSE', id: Date.now() });
+
+
+          const processFile = useCallback((file) => {
+            setError(null);
+            setLoading(true);
+            setLoadingProgress({ status: 'Reading file...', percent: 10 });
+            setExpandSignal(null);
+            setViewMode('tree');
+            setPreviewMode('json'); 
+            setTableAliases({}); 
+            setColumnAliases({}); 
+            setExcludedFields(new Set()); 
+            setSelectedFields(new Set());
+            setSearchTerm('');
+            setFlattenedData(null);
+
+            if (file.size > MAX_FILE_SIZE_BYTES) {
+              setError(`File size exceeds limit of ${MAX_FILE_SIZE_MB}MB.`);
+              setLoading(false);
+              return;
+            }
+
+            const reader = new FileReader();
+            
+            reader.onload = (e) => {
+              const text = e.target.result;
+              const worker = createWorker();
+              
+              worker.postMessage({ 
+                  type: 'PROCESS_FILE', 
+                  payload: { text, useSampling } 
+              });
+
+              worker.onmessage = (ev) => {
+                  const { type, payload } = ev.data;
+                  
+                  if (type === 'PROGRESS') {
+                      setLoadingProgress(payload);
+                  } else if (type === 'SUCCESS') {
+                      const { json: parsed, schema } = payload;
+                      
+                      if (Array.isArray(parsed) && parsed.length > 0) {
+                          setIsArrayMode(true);
+                          setTotalPages(parsed.length);
+                          setCurrentPage(0);
+                      } else {
+                          setIsArrayMode(false);
+                          setTotalPages(1);
+                          setCurrentPage(0);
+                      }
+
+                      setJson(parsed);
+                      setSchemaData(schema);
+                      setFileInfo({
+                          name: file.name.length > 30 ? file.name.slice(0, 30) + '...' : file.name,
+                          fullName: file.name,
+                          size: (file.size / 1024).toFixed(2) + ' KB',
+                          type: file.type || 'application/json'
+                      });
+                      
+                      setLoading(false);
+                      worker.terminate();
+                  } else if (type === 'ERROR') {
+                      setError(payload);
+                      setLoading(false);
+                      worker.terminate();
+                  }
+              };
+
+              worker.onerror = (err) => {
+                  setError("Worker error: " + err.message);
+                  setLoading(false);
+                  worker.terminate();
+              };
+            };
+
+            reader.onerror = () => {
+              setError("Error reading file.");
+              setLoading(false);
+            };
+
+            reader.readAsText(file);
+          }, [useSampling]);
+
+          const handleSchemaTypeChange = useCallback((fieldPath, newType) => {
+            setSchemaData(prev => prev.map(item => item.field === fieldPath ? { ...item, type: newType } : item));
+          }, []);
+          
+          const handleResetSettings = () => {
+              setTableAliases({});
+              setColumnAliases({});
+              setExcludedFields(new Set());
+              setSelectedFields(new Set());
+              setSearchTerm('');
+              if (schemaData) setSchemaData(generateSchema(json, useSampling));
+          };
+
+          const onDragOver = (e) => { e.preventDefault(); setIsDragging(true); };
+          const onDragLeave = (e) => { e.preventDefault(); setIsDragging(false); };
+          const onDrop = (e) => { e.preventDefault(); setIsDragging(false); if (e.dataTransfer.files && e.dataTransfer.files.length > 0) processFile(e.dataTransfer.files[0]); };
+          const handleFileSelect = (e) => { if (e.target.files && e.target.files.length > 0) processFile(e.target.files[0]); };
+          const reset = () => {
+            setJson(null); setSchemaData(null); setTableAliases({}); setColumnAliases({});
+            setFileInfo(null); setError(null); setIsArrayMode(false); setTotalPages(0); setCurrentPage(0);
+            setExpandSignal(null); setSearchTerm('');
+            setExcludedFields(new Set());
+            setSelectedFields(new Set());
+            setFlattenedData(null);
+            if (fileInputRef.current) fileInputRef.current.value = "";
+          };
+
+          const triggerUpload = () => fileInputRef.current.click();
+          const handlePrevPage = () => { if (currentPage > 0) { setCurrentPage(prev => prev - 1); setExpandSignal(null); } };
+          const handleNextPage = () => { if (currentPage < totalPages - 1) { setCurrentPage(prev => prev + 1); setExpandSignal(null); } };
+          
+          const displayData = isArrayMode && json ? json[currentPage] : json;
+
+          return (
+            <div className="h-screen w-full bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 font-sans transition-colors duration-200 overflow-hidden selection:bg-blue-100 selection:text-blue-900 dark:selection:bg-blue-900 dark:selection:text-blue-100">
+              <div className="h-full w-full max-w-7xl mx-auto flex flex-col p-2 md:p-4 relative">
+                {/* Header - Fixed Height */}
+                <header className="flex-none mb-4 flex flex-col md:flex-row items-center gap-4">
+                  <div className="flex-1 w-full md:w-auto flex justify-center md:justify-start">
+                    {json ? (
+                      <div className="flex items-center gap-3">
+                         <div className="p-2 bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400 rounded-lg shrink-0"><FileJson size={20} /></div>
+                         <div className="min-w-0 max-w-[200px] lg:max-w-xs">
+                            <h2 className="font-semibold text-sm md:text-base truncate">{fileInfo?.name}</h2>
+                            <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400"><span>{fileInfo?.size}</span><span>•</span><span className="flex items-center gap-1 text-green-600 dark:text-green-400"><CheckCircle size={12} /> Valid</span></div>
+                         </div>
+                         <div className="flex items-center gap-1 ml-2 border-l border-slate-200 dark:border-slate-700 pl-3">
+                             <Tooltip content="Reset Settings" position="bottom">
+                                <button onClick={handleResetSettings} className="flex items-center justify-center p-1.5 rounded-md text-slate-500 hover:text-slate-700 hover:bg-slate-100 dark:text-slate-400 dark:hover:text-slate-200 dark:hover:bg-slate-800 transition-colors"><RotateCcw size={16} /></button>
+                             </Tooltip>
+                             <Tooltip content="Clear File" position="bottom">
+                                <button onClick={reset} className="flex items-center justify-center p-1.5 rounded-md text-red-500 hover:text-red-700 hover:bg-red-50 dark:text-red-400 dark:hover:text-red-300 dark:hover:bg-red-900/20 transition-colors"><Trash2 size={16} /></button>
+                             </Tooltip>
+                         </div>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-3">
+                         <div className="p-2 bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-lg shrink-0"><Database size={24} /></div>
+                         <div><h1 className="text-xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">JSON to SQL</h1></div>
+                      </div>
+                    )}
+                  </div>
+                  
+                  <div className="flex-1 w-full md:w-auto flex justify-center order-last md:order-none">
+                     {json && (
+                        <div className="relative w-full max-w-md">
+                            <input 
+                                type="text" 
+                                placeholder="Search keys, values, or fields..." 
+                                value={searchTerm} 
+                                onChange={(e) => { 
+                                    setSearchTerm(e.target.value); 
+                                    if (expandSignal) setExpandSignal(null); 
+                                    if (schemaExpandSignal) setSchemaExpandSignal(null); 
+                                }} 
+                                className="w-full pl-10 pr-10 py-2 text-sm bg-white dark:bg-slate-800 border-2 border-slate-200 dark:border-slate-700 focus:border-blue-500 dark:focus:border-blue-500 rounded-full shadow-sm transition-all outline-none placeholder:text-slate-400" 
+                            />
+                            <Search size={18} className="absolute left-3.5 top-1/2 transform -translate-y-1/2 text-slate-400 pointer-events-none" />
+                            {searchTerm && <button onClick={() => setSearchTerm('')} className="absolute right-3 top-1/2 transform -translate-y-1/2 text-slate-400 hover:text-slate-600"><X size={16} /></button>}
+                        </div>
+                     )}
+                  </div>
+                  
+                  <div className="flex-1 w-full md:w-auto flex justify-center md:justify-end items-center gap-4">
+                     <Tooltip content={isDarkMode ? "Switch to Light Mode" : "Switch to Dark Mode"} position="bottom">
+                        <button onClick={toggleDarkMode} className="p-2 rounded-lg bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors">
+                            {isDarkMode ? <Sun size={20} className="text-amber-500" /> : <Moon size={20} className="text-blue-500" />}
+                        </button>
+                     </Tooltip>
+                  </div>
+                </header>
+
+                {/* Loading Overlay */}
+                {loading && (
+                    <div className="absolute inset-0 z-50 bg-white/80 dark:bg-slate-900/80 backdrop-blur-sm flex items-center justify-center rounded-xl">
+                        <div className="flex flex-col items-center gap-4 p-6 bg-white dark:bg-slate-800 rounded-xl shadow-2xl border border-slate-200 dark:border-slate-700">
+                            <Loader2 size={40} className="text-blue-500 animate-spin" />
+                            <div className="text-center">
+                                <h3 className="font-semibold text-lg text-slate-800 dark:text-slate-200">{loadingProgress.status}</h3>
+                                <p className="text-sm text-slate-500 dark:text-slate-400">{loadingProgress.percent}% completed</p>
+                            </div>
+                            <div className="w-48 h-2 bg-slate-100 dark:bg-slate-700 rounded-full overflow-hidden">
+                                <div className="h-full bg-blue-500 transition-all duration-300 ease-out" style={{ width: `${loadingProgress.percent}%` }} />
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {!json && (
+                  <div 
+                    className={`flex-1 flex flex-col items-center justify-center relative border-2 border-dashed rounded-xl p-6 md:p-12 text-center transition-all duration-300 ease-in-out cursor-pointer ${isDragging ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 scale-[1.01]' : 'border-slate-300 dark:border-slate-700 hover:border-blue-400 dark:hover:border-blue-500 bg-white dark:bg-slate-800 shadow-sm'}`} 
+                    onDragOver={onDragOver} 
+                    onDragLeave={onDragLeave} 
+                    onDrop={onDrop}
+                    onClick={triggerUpload}
+                  >
+                    <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept=".json,application/json" className="hidden" />
+                    <div className="flex flex-col items-center justify-center gap-4">
+                      <div className={`p-4 rounded-full ${isDragging ? 'bg-blue-100 text-blue-600' : 'bg-slate-100 dark:bg-slate-700 text-slate-400'}`}><Upload size={40} strokeWidth={1.5} /></div>
+                      <div className="space-y-1">
+                        <h3 className="text-lg font-semibold">Click to Upload or Drag & Drop</h3>
+                        <p className="text-slate-500 dark:text-slate-400 text-sm">JSON files up to {MAX_FILE_SIZE_MB}MB</p>
+                      </div>
+                      
+                      <div className="flex items-center gap-2 mt-4 px-3 py-2 bg-slate-50 dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-700" onClick={(e) => e.stopPropagation()}>
+                          <input type="checkbox" id="sampling" checked={useSampling} onChange={(e) => setUseSampling(e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500" />
+                          <Tooltip content="Smart Sampling" position="right">
+                            <label htmlFor="sampling" className="text-xs font-medium text-slate-600 dark:text-slate-300 flex items-center gap-1 cursor-pointer select-none">
+                                <Zap size={12} className={useSampling ? "text-amber-500" : "text-slate-400"} />
+                                Smart Sampling
+                            </label>
+                          </Tooltip>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {error && (
+                  <div className="mt-6 flex-none p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg flex items-start gap-3 animate-in fade-in slide-in-from-top-4">
+                    <AlertCircle className="text-red-500 shrink-0 mt-0.5" size={20} />
+                    <div className="flex-1"><h3 className="text-red-800 dark:text-red-200 font-medium">Validation Failed</h3><p className="text-red-600 dark:text-red-300 text-sm mt-1">{error}</p></div>
+                    <button onClick={() => setError(null)} className="text-red-400 hover:text-red-600"><X size={18} /></button>
+                  </div>
+                )}
+
+                {json && (
+                  <div className="flex-1 flex flex-row min-h-0 animate-in fade-in slide-in-from-bottom-8 duration-500 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700 shadow-sm bg-white dark:bg-slate-800">
+                    {/* Sidebar with Vertical Tabs */}
+                    <div className={`${isSidebarCollapsed ? 'w-16' : 'w-48'} flex-none bg-slate-50 dark:bg-slate-900/50 border-r border-slate-200 dark:border-slate-700 flex flex-col p-2 gap-1 transition-all duration-300 ease-in-out`}>
+                        <div className={`flex items-center ${isSidebarCollapsed ? 'justify-center' : 'justify-end'} px-2 py-2 mb-1`}>
+                            <Tooltip content={isSidebarCollapsed ? "Expand Sidebar" : "Collapse Sidebar"} position="right">
+                                <button 
+                                    onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+                                    className="p-1 rounded-md text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                                >
+                                    {isSidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+                                </button>
+                            </Tooltip>
+                        </div>
+                        
+                        <button 
+                            onClick={() => setViewMode('tree')} 
+                            className={`group relative flex items-center ${isSidebarCollapsed ? 'justify-center px-0' : 'gap-3 px-3'} py-2 text-sm font-medium rounded-md transition-all ${viewMode === 'tree' ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-slate-200 dark:ring-slate-600' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-200'}`}
+                        >
+                            <Eye size={16} strokeWidth={isSidebarCollapsed ? 2.5 : 2} className="flex-shrink-0" />
+                            {!isSidebarCollapsed && <span className="whitespace-nowrap overflow-hidden">Preview</span>}
+                            <Tooltip content="Preview" position="right" disabled={!isSidebarCollapsed}>
+                                <div className="absolute inset-0 w-full h-full" />
+                            </Tooltip>
+                        </button>
+                        
+                        <button 
+                            onClick={() => setViewMode('schema')} 
+                            className={`group relative flex items-center ${isSidebarCollapsed ? 'justify-center px-0' : 'gap-3 px-3'} py-2 text-sm font-medium rounded-md transition-all ${viewMode === 'schema' ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-slate-200 dark:ring-slate-600' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-200'}`}
+                        >
+                            <Database size={isSidebarCollapsed ? 20 : 16} strokeWidth={isSidebarCollapsed ? 2.5 : 2} className="flex-shrink-0" /> 
+                            {!isSidebarCollapsed && <span className="whitespace-nowrap overflow-hidden">Schema</span>}
+                            <Tooltip content="Schema" position="right" disabled={!isSidebarCollapsed}>
+                                <div className="absolute inset-0 w-full h-full" />
+                            </Tooltip>
+                        </button>
+
+                        <button 
+                            onClick={() => setViewMode('script')} 
+                            className={`group relative flex items-center ${isSidebarCollapsed ? 'justify-center px-0' : 'gap-3 px-3'} py-2 text-sm font-medium rounded-md transition-all ${viewMode === 'script' ? 'bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-slate-200 dark:ring-slate-600' : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-slate-200'}`}
+                        >
+                            <FileText size={16} strokeWidth={isSidebarCollapsed ? 2.5 : 2} className="flex-shrink-0" /> 
+                            {!isSidebarCollapsed && <span className="whitespace-nowrap overflow-hidden">Script</span>}
+                            <Tooltip content="Script" position="right" disabled={!isSidebarCollapsed}>
+                                <div className="absolute inset-0 w-full h-full" />
+                            </Tooltip>
+                        </button>
+                    </div>
+
+                    {/* Main Content Area */}
+                    <div className="flex-1 flex flex-col min-w-0 bg-white dark:bg-slate-800">
+                        {/* Header Toolbar */}
+                        <div className="flex-none h-12 flex items-center justify-between px-4 border-b border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800">
+                            <div className="flex items-center text-sm text-slate-500 flex-1">
+                                {viewMode === 'schema' && selectedFields.size > 0 ? (
+                                    <div className="flex items-center gap-4 animate-in fade-in duration-200 w-full">
+                                        <div className="flex items-center gap-3">
+                                            <span className="text-sm font-semibold text-blue-700 dark:text-blue-400 whitespace-nowrap bg-blue-50 dark:bg-blue-900/30 px-2 py-0.5 rounded-md border border-blue-200 dark:border-blue-800">
+                                                {selectedFields.size} selected
+                                            </span>
+                                            <button onClick={() => setSelectedFields(new Set())} className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 underline">
+                                                Clear
+                                            </button>
+                                        </div>
+                                        <div className="h-5 w-px bg-slate-200 dark:bg-slate-700 mx-2"></div>
+                                        <div className="flex items-center gap-2">
+                                            {allSelectedAreExcluded ? (
+                                                <button 
+                                                    onClick={() => handleBulkExcludeAction(false)} 
+                                                    className="flex items-center gap-1.5 px-2 py-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-green-50 dark:hover:bg-green-900/20 text-green-700 dark:text-green-400 text-xs font-medium rounded shadow-sm transition-colors"
+                                                >
+                                                    <Undo2 size={12} /> Restore
+                                                </button>
+                                            ) : (
+                                                <button 
+                                                    onClick={() => handleBulkExcludeAction(true)} 
+                                                    className="flex items-center gap-1.5 px-2 py-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-red-50 dark:hover:bg-red-900/20 text-red-600 dark:text-red-400 text-xs font-medium rounded shadow-sm transition-colors"
+                                                >
+                                                    <Trash2 size={12} /> Remove
+                                                </button>
+                                            )}
+                                            <div className="flex items-center gap-2 ml-2">
+                                                <div className="w-44">
+                                                    <DataTypeSelect value="Change Type..." onChange={handleBulkSchemaTypeChange} />
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <>
+                                        {viewMode === 'tree' && (
+                                            <div className="flex items-center gap-3">
+                                                <button 
+                                                    onClick={() => setPreviewMode('json')}
+                                                    className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium transition-colors border shadow-sm ${previewMode === 'json' ? 'bg-blue-50 border-blue-200 text-blue-700 dark:bg-blue-900/30 dark:border-blue-700 dark:text-blue-300' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50 dark:bg-slate-800 dark:border-slate-700 dark:hover:bg-slate-700 dark:text-slate-400'}`}
+                                                >
+                                                    <span className="font-mono font-bold">{'{}'}</span> JSON View
+                                                </button>
+                                                <button 
+                                                    onClick={() => setPreviewMode('table')}
+                                                    className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium transition-colors border shadow-sm ${previewMode === 'table' ? 'bg-blue-50 border-blue-200 text-blue-700 dark:bg-blue-900/30 dark:border-blue-700 dark:text-blue-300' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50 dark:bg-slate-800 dark:border-slate-700 dark:hover:bg-slate-700 dark:text-slate-400'}`}
+                                                >
+                                                    <Grid size={14} /> Data Preview
+                                                </button>
+                                                
+                                                {previewMode === 'table' && flattenedData && (
+                                                    <div className="flex items-center gap-3 ml-2 border-l border-slate-200 dark:border-slate-700 pl-3 animate-in fade-in duration-200">
+                                                        <span className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1" title="Total rows based on full dataset">
+                                                            Total Records: <span className="font-semibold text-slate-700 dark:text-slate-200">{totalRecords !== null ? totalRecords : '...'}</span>
+                                                        </span>
+                                                        <span className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1">
+                                                            Columns: <span className="font-semibold text-slate-700 dark:text-slate-200">{Object.keys(effectiveAliases).length}</span>
+                                                        </span>
+                                                        <button 
+                                                            onClick={() => setPreviewLimit(!previewLimit)}
+                                                            disabled={totalRecords !== null && totalRecords <= 100}
+                                                            className={`flex items-center gap-1.5 text-xs font-medium px-2 py-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${previewLimit ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800'}`}
+                                                            title={previewLimit ? "Showing limited 100 rows" : "Showing all rows (max 5000)"}
+                                                        >
+                                                            {previewLimit ? <ToggleLeft size={16} className="text-blue-600 dark:text-blue-400" /> : <ToggleRight size={16} className="text-slate-400" />}
+                                                            Limit 100
+                                                        </button>
+                                                        <button 
+                                                            onClick={handleDownloadCSV}
+                                                            className="flex items-center gap-1.5 px-2 py-1 text-xs font-medium bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 dark:bg-green-900/20 dark:text-green-400 dark:border-green-800 dark:hover:bg-green-900/30 rounded transition-colors"
+                                                            title="Download as CSV"
+                                                        >
+                                                            <Download size={14} /> CSV
+                                                        </button>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+                                        {viewMode === 'schema' && <span className="flex items-center gap-2"><Database size={14}/> Schema</span>}
+                                        {viewMode === 'script' && <span className="flex items-center gap-2"><Code size={14}/> SQL Generation</span>}
+                                    </>
+                                )}
+                            </div>
+                            <div className="flex items-center gap-2">
+                                {isArrayMode && viewMode === 'tree' && previewMode === 'json' && (
+                                    <div className="flex items-center gap-2 mr-4 bg-slate-50 dark:bg-slate-700/50 rounded-lg p-1 border border-slate-200 dark:border-slate-600">
+                                        <Tooltip content="Previous" position="bottom">
+                                            <button onClick={handlePrevPage} disabled={currentPage === 0} className="p-1 text-slate-500 disabled:opacity-30 disabled:cursor-not-allowed hover:text-blue-600 hover:bg-blue-100 dark:hover:bg-slate-600 dark:text-slate-400 rounded transition-colors"><ChevronLeft size={16} /></button>
+                                        </Tooltip>
+                                        <span className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider px-1">{currentPage + 1} / {totalPages}</span>
+                                        <Tooltip content="Next" position="bottom">
+                                            <button onClick={handleNextPage} disabled={currentPage === totalPages - 1} className="p-1 text-slate-500 disabled:opacity-30 disabled:cursor-not-allowed hover:text-blue-600 hover:bg-blue-100 dark:hover:bg-slate-600 dark:text-slate-400 rounded transition-colors"><ChevronRight size={16} /></button>
+                                        </Tooltip>
+                                    </div>
+                                )}
+                                
+                                {((viewMode === 'tree' && previewMode === 'json') || viewMode === 'schema') && (
+                                    <div className="flex items-center gap-1 border-l border-slate-200 dark:border-slate-700 pl-2">
+                                        <Tooltip content="Collapse all" position="bottom">
+                                            <button onClick={handleCollapseAll} className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-slate-700 rounded transition-colors"><Minimize2 size={18} /></button>
+                                        </Tooltip>
+                                        <Tooltip content="Expand all" position="bottom">
+                                            <button onClick={handleExpandAll} className="p-1.5 text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-slate-700 rounded transition-colors"><Maximize2 size={18} /></button>
+                                        </Tooltip>
+                                    </div>
+                                )}
+
+                                {(viewMode === 'schema' || viewMode === 'script') && schemaData && (
+                                    <span className="ml-2 text-xs font-semibold text-slate-500 bg-white dark:bg-slate-700/50 px-2.5 py-1 rounded-md border border-slate-200 dark:border-slate-600 shadow-sm">
+                                        {activeSchema?.length} / {schemaData.length} Fields
+                                    </span>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Viewports */}
+                        <div className="flex-1 relative min-h-0 bg-slate-50/30 dark:bg-slate-900/10">
+                            <div className={`absolute inset-0 p-6 overflow-auto ${viewMode === 'tree' && previewMode === 'json' ? 'block' : 'hidden'}`}>
+                                <JsonNode key={`${fileInfo?.name}-${currentPage}`} name={null} value={displayData} isLast={true} expandSignal={expandSignal} searchTerm={debouncedSearchTerm} />
+                            </div>
+                            <div className={`absolute inset-0 ${viewMode === 'tree' && previewMode === 'table' ? 'block' : 'hidden'}`}>
+                                <DataPreview 
+                                    data={flattenedData}
+                                    columns={Object.values(effectiveAliases)}
+                                />
+                            </div>
+                            <div className={`absolute inset-0 overflow-auto ${viewMode === 'schema' ? 'block' : 'hidden'}`}>
+                                <SchemaView 
+                                    schema={schemaData} 
+                                    onTypeChange={handleSchemaTypeChange} 
+                                    searchTerm={debouncedSearchTerm} 
+                                    expandSignal={schemaExpandSignal} 
+                                    onBulkUpdate={handleBulkSchemaTypeChange}
+                                    columnAliases={columnAliases}
+                                    onColumnAliasChange={setColumnAliases}
+                                    effectiveAliases={effectiveAliases}
+                                    excludedFields={excludedFields}
+                                    onBulkExclude={handleBulkExcludeAction}
+                                    selectedFields={selectedFields}
+                                    onSelect={handleSelect}
+                                    onSelectAll={handleSelectAll}
+                                />
+                            </div>
+                            <div className={`absolute inset-0 ${viewMode === 'script' ? 'block' : 'hidden'}`}>
+                                <ScriptView 
+                                    schema={activeSchema} 
+                                    columnAliases={columnAliases} 
+                                    onColumnAliasChange={setColumnAliases} 
+                                    searchTerm={debouncedSearchTerm}
+                                    effectiveAliases={effectiveAliases}
+                                />
+                            </div>
+                        </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        }
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
