@@ -43,6 +43,7 @@
         {
             "imports": {
                 "react": "https://esm.sh/react@18.2.0",
+                "react-dom": "https://esm.sh/react-dom@18.2.0",
                 "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
                 "lucide-react": "https://esm.sh/lucide-react@0.263.1"
             }
@@ -91,8 +92,9 @@
     <div id="root" class="h-full w-full"></div>
 
     <script type="text/babel" data-type="module">
-        import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+        import React, { useState, useRef, useEffect, useMemo, useCallback, useDeferredValue } from 'react';
         import { createRoot } from 'react-dom/client';
+        import { createPortal } from 'react-dom';
         import { 
           Upload, FileJson, AlertCircle, X, ChevronRight, ChevronDown, 
           CheckCircle, Trash2, ChevronLeft, Maximize2, Minimize2, 
@@ -100,7 +102,7 @@
           PanelLeftClose, PanelLeftOpen, Undo2, Folder, FolderOpen, List, Grid, ToggleLeft, ToggleRight, Minus
         } from 'lucide-react';
 
-        const MAX_FILE_SIZE_MB = 2; 
+        const MAX_FILE_SIZE_MB = 20; 
         const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
         const MAX_ITEMS_PREVIEW = 20; 
         const MAX_STRING_LENGTH = 100;
@@ -114,18 +116,284 @@
             "Other": ['GEOMETRY', 'VARBYTE']
         };
 
+        // --- Worker Logic ---
+        const WORKER_CODE = `
+            // Helper function to map Redshift types
+            const getRedshiftType = (value) => {
+                if (value === null) return 'VARCHAR(256)'; 
+                const type = typeof value;
+                if (type === 'boolean') return 'BOOLEAN';
+                if (type === 'number') return Number.isInteger(value) ? 'BIGINT' : 'DOUBLE PRECISION';
+                if (type === 'string') {
+                    if (value.length >= 10 && value.length <= 30 && !isNaN(Date.parse(value)) && (value.includes('-') || value.includes('/'))) {
+                    return value.includes(':') ? 'TIMESTAMP' : 'DATE';
+                    }
+                    if (value.length > 256) return 'VARCHAR(65535)';
+                    return 'VARCHAR(256)';
+                }
+                if (Array.isArray(value)) return 'SUPER'; 
+                if (type === 'object') return 'SUPER'; 
+                return 'VARCHAR(256)';
+            };
+
+            const generateSchema = (data, useSampling = false) => {
+                const fieldMap = new Map();
+                let dataToProcess = data;
+                if (useSampling && Array.isArray(data) && data.length > 500) {
+                    const subset = [];
+                    subset.push(...data.slice(0, 20));
+                    const step = Math.ceil(data.length / 200);
+                    for(let i = 20; i < data.length; i += step) {
+                        subset.push(data[i]);
+                    }
+                    dataToProcess = subset;
+                }
+
+                const registerField = (path, value) => {
+                    const redshiftType = getRedshiftType(value);
+                    if (!fieldMap.has(path)) {
+                        fieldMap.set(path, { type: redshiftType, sample: value });
+                    } else {
+                        const current = fieldMap.get(path);
+                        if (current.sample === null && value !== null) {
+                            fieldMap.set(path, { type: redshiftType, sample: value });
+                        }
+                    }
+                };
+
+                const traverse = (currentValue, currentPath) => {
+                    if (currentValue === null) {
+                        registerField(currentPath, null);
+                        return;
+                    }
+                    if (Array.isArray(currentValue)) {
+                        if (currentValue.length === 0) {
+                            registerField(currentPath, []); 
+                            return;
+                        }
+                        const nextPathBase = currentPath ? \`\${currentPath}[]\` : ''; 
+                        currentValue.forEach(item => traverse(item, nextPathBase));
+                        return;
+                    }
+                    if (typeof currentValue === 'object') {
+                        const keys = Object.keys(currentValue);
+                        if (keys.length === 0) {
+                            registerField(currentPath, {}); 
+                            return;
+                        }
+                        keys.forEach(key => {
+                            const nextPath = currentPath ? \`\${currentPath}.\${key}\` : key;
+                            traverse(currentValue[key], nextPath);
+                        });
+                        return;
+                    }
+                    registerField(currentPath, currentValue);
+                };
+
+                if (Array.isArray(dataToProcess)) {
+                    dataToProcess.forEach(item => traverse(item, ''));
+                } else {
+                    traverse(dataToProcess, '');
+                }
+
+                return Array.from(fieldMap.entries())
+                    .filter(([field]) => field !== '') 
+                    .map(([field, info]) => ({
+                    field,
+                    type: info.type,
+                    originalType: info.type, 
+                    sample: info.sample
+                    }));
+            };
+
+            const getArrayPaths = (schema) => {
+                if (!schema) return [];
+                const arrayPaths = new Set();
+                schema.forEach(item => {
+                    const parts = item.field.split('.');
+                    let pathSoFar = "";
+                    parts.forEach(part => {
+                        let partName = part;
+                        let arrayCount = 0;
+                        while (partName.endsWith('[]')) {
+                            partName = partName.slice(0, -2);
+                            arrayCount++;
+                        }
+                        let currentBase = pathSoFar ? \`\${pathSoFar}.\${partName}\` : partName;
+                        for (let i = 0; i < arrayCount; i++) {
+                            let p = currentBase;
+                            for (let k = 0; k < i; k++) p += \"[]\";
+                            arrayPaths.add(p);
+                        }
+                        pathSoFar = pathSoFar ? \`\${pathSoFar}.\${part}\` : part;
+                    });
+                });
+                return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
+            };
+
+            const getValue = (obj, path) => {
+                if (!path) return obj;
+                const parts = path.split('.');
+                let current = obj;
+                for (let part of parts) {
+                    if (current === null || current === undefined) return null;
+                    current = current[part];
+                }
+                return current;
+            };
+
+            const generateFlattenedData = (json, schema, aliases, limit) => {
+                const sortedArrays = getArrayPaths(schema);
+                const resultRows = [];
+                const maxOutputRows = limit || 5000; 
+                const dataToProcess = Array.isArray(json) ? json : [json];
+
+                for (const record of dataToProcess) {
+                    if (resultRows.length >= maxOutputRows) break;
+                    let contexts = [{ "": record }];
+
+                    for (const arrayPath of sortedArrays) {
+                        const nextContexts = [];
+                        let parentArrayPath = "";
+                        for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
+                            if (arrayPath.startsWith(sortedArrays[i])) {
+                                parentArrayPath = sortedArrays[i];
+                                break;
+                            }
+                        }
+
+                        let relativePath = arrayPath;
+                        if (parentArrayPath) relativePath = arrayPath.substring(parentArrayPath.length);
+                        if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
+                        if (relativePath.endsWith('[]')) relativePath = relativePath.slice(0, -2);
+
+                        for (const ctx of contexts) {
+                            const parentData = ctx[parentArrayPath || ""];
+                            let arrayData = null;
+                            if (parentData) arrayData = getValue(parentData, relativePath);
+
+                            if (Array.isArray(arrayData) && arrayData.length > 0) {
+                                for (const item of arrayData) nextContexts.push({ ...ctx, [arrayPath]: item });
+                            } else {
+                                nextContexts.push({ ...ctx, [arrayPath]: null });
+                            }
+                        }
+                        contexts = nextContexts;
+                        if (contexts.length > maxOutputRows) break; 
+                    }
+
+                    for (const ctx of contexts) {
+                        if (resultRows.length >= maxOutputRows) break;
+                        const row = {};
+                        schema.forEach(fieldItem => {
+                            const fullPath = fieldItem.field;
+                            let deepestArrayPath = "";
+                            for (const arrayPath of sortedArrays) {
+                                if (fullPath === arrayPath || fullPath.startsWith(arrayPath + '.') || fullPath.startsWith(arrayPath + '[')) {
+                                    if (arrayPath.length > deepestArrayPath.length) deepestArrayPath = arrayPath;
+                                }
+                            }
+                            const contextObj = ctx[deepestArrayPath || ""];
+                            let value = null;
+                            if (contextObj !== null && contextObj !== undefined) {
+                                let relativePath = fullPath;
+                                if (deepestArrayPath) relativePath = fullPath.substring(deepestArrayPath.length);
+                                if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
+                                if (!relativePath) value = contextObj;
+                                else value = getValue(contextObj, relativePath.replace(/\\[\\]/g, ''));
+                            }
+                            const header = aliases[fullPath] || fullPath;
+                            row[header] = (value !== null && typeof value === 'object') ? JSON.stringify(value) : value;
+                        });
+                        resultRows.push(row);
+                    }
+                }
+                return resultRows;
+            };
+
+             const calculateContextCount = (contexts, arrayPath, sortedArrays) => {
+                  const nextContexts = [];
+                  let parentArrayPath = "";
+                  for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
+                      if (arrayPath.startsWith(sortedArrays[i])) {
+                          parentArrayPath = sortedArrays[i];
+                          break;
+                      }
+                  }
+                  let relativePath = arrayPath;
+                  if (parentArrayPath) relativePath = arrayPath.substring(parentArrayPath.length);
+                  if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
+                  if (relativePath.endsWith('[]')) relativePath = relativePath.slice(0, -2);
+
+                  for (const ctx of contexts) {
+                      const parentData = ctx[parentArrayPath || ""];
+                      let arrayData = null;
+                      if (parentData) arrayData = getValue(parentData, relativePath);
+                      if (Array.isArray(arrayData) && arrayData.length > 0) {
+                          for (const item of arrayData) nextContexts.push({ ...ctx, [arrayPath]: item });
+                      } else {
+                          nextContexts.push({ ...ctx, [arrayPath]: null });
+                      }
+                  }
+                  return nextContexts;
+              };
+
+            const countTotalRows = (json, schema) => {
+                const sortedArrays = getArrayPaths(schema);
+                const dataToProcess = Array.isArray(json) ? json : [json];
+                let totalCount = 0;
+                for (const record of dataToProcess) {
+                    let contexts = [{ "": record }];
+                    for (const arrayPath of sortedArrays) {
+                        contexts = calculateContextCount(contexts, arrayPath, sortedArrays);
+                    }
+                    totalCount += contexts.length;
+                }
+                return totalCount;
+            };
+
+            self.onmessage = function(e) {
+                const { type, payload } = e.data;
+                if (type === 'PROCESS_FILE') {
+                    try {
+                        const { text, useSampling } = payload;
+                        self.postMessage({ type: 'PROGRESS', payload: { status: 'Parsing JSON...', percent: 30 } });
+                        const parsed = JSON.parse(text);
+                        self.postMessage({ type: 'PROGRESS', payload: { status: 'Analyzing Schema...', percent: 60 } });
+                        const schema = generateSchema(parsed, useSampling);
+                        self.postMessage({ type: 'PROGRESS', payload: { status: 'Finalizing...', percent: 90 } });
+                        self.postMessage({ type: 'SUCCESS', payload: { json: parsed, schema: schema } });
+                    } catch (err) {
+                        self.postMessage({ type: 'ERROR', payload: err.message });
+                    }
+                } else if (type === 'FLATTEN_DATA') {
+                    try {
+                        const { json, schema, aliases, limit } = payload;
+                        const flatData = generateFlattenedData(json, schema, aliases, limit);
+                        self.postMessage({ type: 'FLATTEN_SUCCESS', payload: flatData });
+                    } catch (err) {
+                        self.postMessage({ type: 'ERROR', payload: \"Flattening failed: \" + err.message });
+                    }
+                } else if (type === 'CALC_TOTAL_ROWS') {
+                     try {
+                          const { json, schema } = payload;
+                          const count = countTotalRows(json, schema);
+                          self.postMessage({ type: 'TOTAL_ROWS_SUCCESS', payload: count });
+                      } catch (err) { console.error(err); }
+                }
+            };
+        `;
+
         // --- Custom Reusable Components ---
 
         const Tooltip = ({ content, children, position = 'top', disabled = false }) => {
           if (disabled || !content) return <>{children}</>;
-
           const positions = {
             top: 'bottom-full left-1/2 -translate-x-1/2 mb-2',
             bottom: 'top-full left-1/2 -translate-x-1/2 mt-2',
             left: 'right-full top-1/2 -translate-y-1/2 mr-2',
             right: 'left-full top-1/2 -translate-y-1/2 ml-2'
           };
-
           return (
             <div className="group relative inline-flex items-center justify-center">
               {children}
@@ -136,316 +404,7 @@
           );
         };
 
-        // --- Pure Functions for Logic ---
-
-        const getRedshiftType = (value) => {
-          if (value === null) return 'VARCHAR(256)'; 
-          const type = typeof value;
-          if (type === 'boolean') return 'BOOLEAN';
-          if (type === 'number') return Number.isInteger(value) ? 'BIGINT' : 'DOUBLE PRECISION';
-          if (type === 'string') {
-            if (value.length >= 10 && value.length <= 30 && !isNaN(Date.parse(value)) && (value.includes('-') || value.includes('/'))) {
-              return value.includes(':') ? 'TIMESTAMP' : 'DATE';
-            }
-            if (value.length > 256) return 'VARCHAR(65535)';
-            return 'VARCHAR(256)';
-          }
-          if (Array.isArray(value)) return 'SUPER'; 
-          if (type === 'object') return 'SUPER'; 
-          return 'VARCHAR(256)';
-        };
-
-        const generateSchema = (data, useSampling = false) => {
-          const fieldMap = new Map();
-
-          let dataToProcess = data;
-          if (useSampling && Array.isArray(data) && data.length > 500) {
-              const subset = [];
-              subset.push(...data.slice(0, 20));
-              const step = Math.ceil(data.length / 200);
-              for(let i = 20; i < data.length; i += step) {
-                  subset.push(data[i]);
-              }
-              dataToProcess = subset;
-          }
-
-          const registerField = (path, value) => {
-              const redshiftType = getRedshiftType(value);
-              if (!fieldMap.has(path)) {
-                  fieldMap.set(path, { type: redshiftType, sample: value });
-              } else {
-                  const current = fieldMap.get(path);
-                  if (current.sample === null && value !== null) {
-                      fieldMap.set(path, { type: redshiftType, sample: value });
-                  }
-              }
-          };
-
-          const traverse = (currentValue, currentPath) => {
-            if (currentValue === null) {
-                registerField(currentPath, null);
-                return;
-            }
-            if (Array.isArray(currentValue)) {
-                if (currentValue.length === 0) {
-                    registerField(currentPath, []); 
-                    return;
-                }
-                const nextPathBase = currentPath ? `${currentPath}[]` : ''; 
-                currentValue.forEach(item => traverse(item, nextPathBase));
-                return;
-            }
-            if (typeof currentValue === 'object') {
-                const keys = Object.keys(currentValue);
-                if (keys.length === 0) {
-                     registerField(currentPath, {}); 
-                     return;
-                }
-                keys.forEach(key => {
-                    const nextPath = currentPath ? `${currentPath}.${key}` : key;
-                    traverse(currentValue[key], nextPath);
-                });
-                return;
-            }
-            registerField(currentPath, currentValue);
-          };
-
-          if (Array.isArray(dataToProcess)) {
-              dataToProcess.forEach(item => traverse(item, ''));
-          } else {
-              traverse(dataToProcess, '');
-          }
-
-          return Array.from(fieldMap.entries())
-            .filter(([field]) => field !== '') 
-            .map(([field, info]) => ({
-              field,
-              type: info.type,
-              originalType: info.type, 
-              sample: info.sample
-            }));
-        };
-
-        // --- Worker Builder ---
-        const createWorker = () => {
-            const workerCode = `
-              const getRedshiftType = ${getRedshiftType.toString()};
-              const generateSchema = ${generateSchema.toString()};
-
-              // --- Flattening Logic simulating SQL LEFT JOIN UNNEST ---
-              const getArrayPaths = (schema) => {
-                  if (!schema) return [];
-                  const arrayPaths = new Set();
-                  schema.forEach(item => {
-                      const parts = item.field.split('.');
-                      let pathSoFar = "";
-                      parts.forEach(part => {
-                          let partName = part;
-                          let arrayCount = 0;
-                          while (partName.endsWith('[]')) {
-                              partName = partName.slice(0, -2);
-                              arrayCount++;
-                          }
-                          let currentBase = pathSoFar ? \`\${pathSoFar}.\${partName}\` : partName;
-                          for (let i = 0; i < arrayCount; i++) {
-                              let p = currentBase;
-                              for (let k = 0; k < i; k++) p += \"[]\";
-                              arrayPaths.add(p);
-                          }
-                          pathSoFar = pathSoFar ? \`\${pathSoFar}.\${part}\` : part;
-                      });
-                  });
-                  return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
-              };
-
-              const getValue = (obj, path) => {
-                  if (!path) return obj;
-                  const parts = path.split('.');
-                  let current = obj;
-                  for (let part of parts) {
-                      if (current === null || current === undefined) return null;
-                      current = current[part];
-                  }
-                  return current;
-              };
-
-              const calculateContextCount = (contexts, arrayPath, sortedArrays) => {
-                  const nextContexts = [];
-                  let parentArrayPath = "";
-                  for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
-                      if (arrayPath.startsWith(sortedArrays[i])) {
-                          parentArrayPath = sortedArrays[i];
-                          break;
-                      }
-                  }
-                  let relativePath = arrayPath;
-                  if (parentArrayPath) {
-                      relativePath = arrayPath.substring(parentArrayPath.length);
-                  }
-                  if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
-                  if (relativePath.endsWith('[]')) relativePath = relativePath.slice(0, -2);
-
-                  for (const ctx of contexts) {
-                      const parentData = ctx[parentArrayPath || ""];
-                      let arrayData = null;
-                      if (parentData) arrayData = getValue(parentData, relativePath);
-
-                      if (Array.isArray(arrayData) && arrayData.length > 0) {
-                          for (const item of arrayData) {
-                              nextContexts.push({ ...ctx, [arrayPath]: item });
-                          }
-                      } else {
-                          nextContexts.push({ ...ctx, [arrayPath]: null });
-                      }
-                  }
-                  return nextContexts;
-              };
-
-              const countTotalRows = (json, schema) => {
-                  const sortedArrays = getArrayPaths(schema);
-                  const dataToProcess = Array.isArray(json) ? json : [json];
-                  let totalCount = 0;
-
-                  for (const record of dataToProcess) {
-                      let contexts = [{ "": record }];
-                      for (const arrayPath of sortedArrays) {
-                          contexts = calculateContextCount(contexts, arrayPath, sortedArrays);
-                      }
-                      totalCount += contexts.length;
-                  }
-                  return totalCount;
-              };
-
-              const generateFlattenedData = (json, schema, aliases, limit) => {
-                  const sortedArrays = getArrayPaths(schema);
-                  const resultRows = [];
-                  const maxOutputRows = limit || 10000; 
-                  // CRITICAL FIX: Do NOT slice input json here. We must iterate all to find data until limit is hit.
-                  const dataToProcess = Array.isArray(json) ? json : [json];
-
-                  for (const record of dataToProcess) {
-                      if (resultRows.length >= maxOutputRows) break;
-                      
-                      let contexts = [{ "": record }];
-
-                      for (const arrayPath of sortedArrays) {
-                          const nextContexts = [];
-                          let parentArrayPath = "";
-                          for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
-                              if (arrayPath.startsWith(sortedArrays[i])) {
-                                  parentArrayPath = sortedArrays[i];
-                                  break;
-                              }
-                          }
-
-                          let relativePath = arrayPath;
-                          if (parentArrayPath) {
-                              relativePath = arrayPath.substring(parentArrayPath.length);
-                          }
-                          if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
-                          if (relativePath.endsWith('[]')) relativePath = relativePath.slice(0, -2);
-
-                          for (const ctx of contexts) {
-                              const parentData = ctx[parentArrayPath || ""];
-                              let arrayData = null;
-                              if (parentData) {
-                                  arrayData = getValue(parentData, relativePath);
-                              }
-
-                              if (Array.isArray(arrayData) && arrayData.length > 0) {
-                                  for (const item of arrayData) {
-                                      nextContexts.push({ ...ctx, [arrayPath]: item });
-                                  }
-                              } else {
-                                  nextContexts.push({ ...ctx, [arrayPath]: null });
-                              }
-                          }
-                          contexts = nextContexts;
-                          if (contexts.length > maxOutputRows) break; 
-                      }
-
-                      for (const ctx of contexts) {
-                          if (resultRows.length >= maxOutputRows) break;
-                          
-                          const row = {};
-                          schema.forEach(fieldItem => {
-                              const fullPath = fieldItem.field;
-                              let deepestArrayPath = "";
-                              for (const arrayPath of sortedArrays) {
-                                  if (fullPath === arrayPath || fullPath.startsWith(arrayPath + '.') || fullPath.startsWith(arrayPath + '[')) {
-                                      if (arrayPath.length > deepestArrayPath.length) deepestArrayPath = arrayPath;
-                                  }
-                              }
-
-                              const contextObj = ctx[deepestArrayPath || ""];
-                              let value = null;
-                              
-                              if (contextObj !== null && contextObj !== undefined) {
-                                  let relativePath = fullPath;
-                                  if (deepestArrayPath) {
-                                      relativePath = fullPath.substring(deepestArrayPath.length);
-                                  }
-                                  if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
-                                  
-                                  if (!relativePath) {
-                                      value = contextObj;
-                                  } else {
-                                      const cleanPath = relativePath.replace(/\\[\\]/g, ''); 
-                                      value = getValue(contextObj, cleanPath);
-                                  }
-                              }
-                              
-                              const header = aliases[fullPath] || fullPath;
-                              if (value !== null && typeof value === 'object') {
-                                  row[header] = JSON.stringify(value);
-                              } else {
-                                  row[header] = value;
-                              }
-                          });
-                          resultRows.push(row);
-                      }
-                  }
-                  return resultRows;
-              };
-
-              self.onmessage = function(e) {
-                  const { type, payload } = e.data;
-                  
-                  if (type === 'PROCESS_FILE') {
-                      try {
-                          const { text, useSampling } = payload;
-                          self.postMessage({ type: 'PROGRESS', payload: { status: 'Parsing JSON...', percent: 30 } });
-                          const parsed = JSON.parse(text);
-                          self.postMessage({ type: 'PROGRESS', payload: { status: 'Analyzing Schema...', percent: 60 } });
-                          const schema = generateSchema(parsed, useSampling);
-                          self.postMessage({ type: 'PROGRESS', payload: { status: 'Finalizing...', percent: 90 } });
-                          self.postMessage({ type: 'SUCCESS', payload: { json: parsed, schema: schema } });
-                      } catch (err) {
-                          self.postMessage({ type: 'ERROR', payload: err.message });
-                      }
-                  } else if (type === 'FLATTEN_DATA') {
-                      try {
-                          const { json, schema, aliases, limit } = payload;
-                          const flatData = generateFlattenedData(json, schema, aliases, limit);
-                          self.postMessage({ type: 'FLATTEN_SUCCESS', payload: flatData });
-                      } catch (err) {
-                          self.postMessage({ type: 'ERROR', payload: \"Flattening failed: \" + err.message });
-                      }
-                  } else if (type === 'CALC_TOTAL_ROWS') {
-                      try {
-                          const { json, schema } = payload;
-                          const count = countTotalRows(json, schema);
-                          self.postMessage({ type: 'TOTAL_ROWS_SUCCESS', payload: count });
-                      } catch (err) {
-                           console.error(err);
-                      }
-                  }
-              };
-            `;
-            const blob = new Blob([workerCode], { type: "application/javascript" });
-            return new Worker(URL.createObjectURL(blob));
-        };
-
+        // --- Helper: useDebounce ---
         function useDebounce(value, delay) {
           const [debouncedValue, setDebouncedValue] = useState(value);
           useEffect(() => {
@@ -454,6 +413,12 @@
           }, [value, delay]);
           return debouncedValue;
         }
+
+        // --- Worker Creation ---
+        const createWorker = () => {
+            const blob = new Blob([WORKER_CODE], { type: "application/javascript" });
+            return new Worker(URL.createObjectURL(blob));
+        };
 
         // --- SQL Generation Logic ---
         
@@ -577,7 +542,8 @@
                 return `    CAST(${selection} AS ${castType}) AS "${colAlias}"`;
             });
             
-            let fromClause = `FROM\n    "${sourceTable}" AS "${aliases[""] || "src"}"`;
+            // Removed double quotes around sourceTable
+            let fromClause = `FROM\n    ${sourceTable} AS "${aliases[""] || "src"}"`;
             
             sortedArrays.forEach((arrayPath) => {
                 const alias = aliases[arrayPath];
@@ -652,7 +618,7 @@
         };
 
         // --- UI Helper Components ---
-        // ... (HighlightText, HighlightSql, FormattedField, DataTypeSelect, SortKeySelector, JsonPrimitive, JsonNode, DataPreview, buildSchemaTree components remain unchanged) ...
+        // ... (HighlightText, HighlightSql, FormattedField, DataTypeSelect, SortKeySelector, JsonPrimitive components remain unchanged) ...
 
         const HighlightText = React.memo(({ text, highlight }) => {
             const safeText = String(text || '');
@@ -753,7 +719,8 @@
             };
 
             const handleScroll = (event) => {
-                if (menuRef.current && menuRef.current.contains(event.target)) {
+                // Close if we scroll a parent, but NOT if we scroll the menu itself.
+                if (menuRef.current && (menuRef.current === event.target || menuRef.current.contains(event.target))) {
                     return;
                 }
                 setIsOpen(false);
@@ -762,10 +729,12 @@
             if (isOpen) {
                 document.addEventListener('mousedown', handleClickOutside);
                 window.addEventListener('scroll', handleScroll, true); 
+                window.addEventListener('resize', handleScroll);
             }
             return () => {
                 document.removeEventListener('mousedown', handleClickOutside);
                 window.removeEventListener('scroll', handleScroll, true);
+                window.removeEventListener('resize', handleScroll);
             };
           }, [isOpen]);
 
@@ -773,12 +742,20 @@
             if (isCustomMode) return; 
             if (!isOpen && containerRef.current) {
                 const rect = containerRef.current.getBoundingClientRect();
+                const windowHeight = window.innerHeight;
                 let top = rect.bottom;
-                if (window.innerHeight - rect.bottom < 300) {
-                    top = rect.top - 300; 
-                     if (top < 0) top = rect.bottom; 
+                
+                // Basic flip logic if too close to bottom
+                if (windowHeight - rect.bottom < 300) {
+                     top = rect.top - 300; // rough height of menu
+                     if (top < 0) top = rect.bottom; // fallback
                 }
-                setCoords({ top: rect.bottom, left: rect.left, width: rect.width });
+                
+                setCoords({ 
+                    top: rect.bottom, // Use direct viewport relative coordinate since body doesn't scroll
+                    left: rect.left, 
+                    width: rect.width 
+                });
             }
             setIsOpen(!isOpen);
           };
@@ -825,7 +802,7 @@
                 </button>
               )}
               
-              {isOpen && (
+              {isOpen && createPortal(
                 <div 
                     ref={menuRef}
                     style={{ position: 'fixed', top: `${coords.top}px`, left: `${coords.left}px`, width: `${coords.width}px`, zIndex: 9999 }}
@@ -849,7 +826,8 @@
                       ))}
                     </div>
                   ))}
-                </div>
+                </div>,
+                document.body
               )}
             </div>
           );
@@ -1470,7 +1448,6 @@
                          <div className="w-10 text-center border-r border-slate-200 dark:border-slate-700 h-full flex items-center justify-center">
                             <input type="checkbox" onChange={handleSelectAllFiltered} checked={areAllFilteredSelected} className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700 cursor-pointer" />
                          </div>
-                         {/* Removed empty div here */}
                          <div className="flex-1 px-2 uppercase tracking-wider">Field Name</div>
                          <div className="w-[15%] min-w-[120px] px-2 uppercase tracking-wider">Type</div>
                          <div className="w-[25%] min-w-[150px] px-2 uppercase tracking-wider">Column name</div>
@@ -1612,7 +1589,11 @@
                         </div>
                         <div className="flex items-center gap-2">
                             <Tooltip content="Download SQL file" position="bottom">
-                                <button onClick={handleDownload} className="flex items-center gap-2 px-3 py-1.5 bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 dark:bg-green-900/20 dark:text-green-400 dark:border-green-800 dark:hover:bg-green-900/30 rounded text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                                <button 
+                                    onClick={handleDownload} 
+                                    disabled={!sqlScript || sqlScript.startsWith('-- No schema')}
+                                    className="flex items-center gap-2 px-3 py-1.5 bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 dark:bg-green-900/20 dark:text-green-400 dark:border-green-800 dark:hover:bg-green-900/30 rounded text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
                                     <Download size={14} />
                                 </button>
                             </Tooltip>
