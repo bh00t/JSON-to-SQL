@@ -5,6 +5,32 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>JSON to SQL</title>
     
+    <!-- 
+      ================================================================================
+      PROJECT ARCHITECTURE & TECH STACK
+      ================================================================================
+      
+      Architecture: Single File Component (SFC) / SPA
+      - The entire application lives in this one HTML file. 
+      - This ensures zero-setup portability (just double-click to run).
+      - All logic, including the Web Worker, React Components, and Styles are embedded here.
+
+      Tech Stack:
+      1. React (via ESM): UI Component library for managing complex state (schema, preview).
+      2. Babel (Standalone): Compiles JSX/ES6+ code in the browser at runtime.
+      3. Tailwind CSS (CDN): Utility-first CSS framework for rapid, responsive UI design.
+      4. Lucide React (ESM): Icon library.
+      5. Web Workers: Used to offload heavy JSON parsing and array flattening logic 
+         to a background thread, keeping the UI responsive.
+
+      Core Features:
+      - JSON Schema Inference with Type Detection (Redshift flavor).
+      - Virtualized Tables for handling massive datasets (up to 5000 rows previewed efficiently).
+      - Recursive Tree Views for visualizing JSON structure.
+      - Auto-generation of SQL (DDL and VIEWs) with smart alias collision handling.
+      ================================================================================
+    -->
+    
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -38,7 +64,7 @@
     <!-- Google Fonts -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
 
-    <!-- React & Babel -->
+    <!-- React & Babel Imports -->
     <script type="importmap">
         {
             "imports": {
@@ -52,7 +78,9 @@
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
     <style>
-        /* Custom Scrollbar */
+        /* Custom Scrollbar Styles 
+           Provides a consistent, sleek look across browsers, matching the Tailwind theme.
+        */
         ::-webkit-scrollbar {
             width: 10px;
             height: 10px;
@@ -78,13 +106,16 @@
         
         body {
             font-family: 'Inter', sans-serif;
-            overflow: hidden; /* Prevent body scroll */
+            overflow: hidden; /* Prevent body scroll, let React containers handle scrolling via Virtualization */
         }
         
-        /* Optimization for large lists */
+        /* Performance Optimization for Large Lists 
+           'contain: strict' tells the browser that content inside this container 
+           won't affect layout outside, speeding up scrolling calculations.
+        */
         .virtual-list-container {
             will-change: transform;
-            contain: strict; /* Performance optimization for scrolling */
+            contain: strict; 
         }
     </style>
 </head>
@@ -102,29 +133,50 @@
           PanelLeftClose, PanelLeftOpen, Undo2, Folder, FolderOpen, List, Grid, ToggleLeft, ToggleRight, Minus
         } from 'lucide-react';
 
+        // --- CONSTANTS ---
         const MAX_FILE_SIZE_MB = 20; 
         const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
         const MAX_ITEMS_PREVIEW = 20; 
         const MAX_STRING_LENGTH = 100;
 
+        // SQL Data Type Mappings
+        // These are standard types used in AWS Redshift, Postgres, and Snowflake.
         const CATEGORIZED_TYPES = {
             "Numeric": ['SMALLINT', 'INTEGER', 'BIGINT', 'DECIMAL', 'REAL', 'DOUBLE PRECISION'],
             "Character": ['CHAR', 'VARCHAR', 'VARCHAR(256)', 'VARCHAR(65535)', 'TEXT'],
             "Date & Time": ['DATE', 'TIMESTAMP', 'TIMESTAMPTZ'],
             "Boolean": ['BOOLEAN'],
-            "Semi-structured": ['SUPER'],
+            "Semi-structured": ['SUPER'], // 'SUPER' is Redshift's JSON type
             "Other": ['GEOMETRY', 'VARBYTE']
         };
 
-        // --- Worker Logic ---
+        /**
+         * =================================================================================
+         * WEB WORKER LOGIC
+         * =================================================================================
+         * Why a Worker? 
+         * Parsing 20MB of JSON, inferring schemas from 100k rows, and flattening nested structures
+         * is computationally expensive (O(N) or O(N*M)). Doing this on the main thread would freeze 
+         * the UI/React rendering.
+         * * This string is converted to a Blob and executed in a separate thread.
+         */
         const WORKER_CODE = `
-            // Helper function to map Redshift types
+            /**
+             * Function: getRedshiftType
+             * Purpose: Analyzes a JS value and guesses the most appropriate SQL type.
+             * Logic:
+             * - Checks for primitive types (bool, number).
+             * - Heuristic checks for Date strings (ISO format, slashes).
+             * - Length checks for VARCHAR sizing.
+             * - Arrays/Objects default to 'SUPER' (JSON).
+             */
             const getRedshiftType = (value) => {
                 if (value === null) return 'VARCHAR(256)'; 
                 const type = typeof value;
                 if (type === 'boolean') return 'BOOLEAN';
                 if (type === 'number') return Number.isInteger(value) ? 'BIGINT' : 'DOUBLE PRECISION';
                 if (type === 'string') {
+                    // Basic date detection regex/logic
                     if (value.length >= 10 && value.length <= 30 && !isNaN(Date.parse(value)) && (value.includes('-') || value.includes('/'))) {
                     return value.includes(':') ? 'TIMESTAMP' : 'DATE';
                     }
@@ -136,24 +188,38 @@
                 return 'VARCHAR(256)';
             };
 
+            /**
+             * Function: generateSchema
+             * Purpose: Crawls the JSON structure to build a flat map of all possible fields.
+             * Optimization:
+             * - "Sampling": If useSampling is true, it skips rows. Instead of checking 100k rows,
+             * it checks the first 20 (to capture headers) and then samples every Nth row.
+             * This drastically reduces processing time for large files.
+             */
             const generateSchema = (data, useSampling = false) => {
                 const fieldMap = new Map();
                 let dataToProcess = data;
+                
+                // OPTIMIZATION: Sampling Logic
                 if (useSampling && Array.isArray(data) && data.length > 500) {
                     const subset = [];
+                    // Always take the first 20 records (high probability of schema definition)
                     subset.push(...data.slice(0, 20));
                     const step = Math.ceil(data.length / 200);
+                    // Take distributed samples from the rest
                     for(let i = 20; i < data.length; i += step) {
                         subset.push(data[i]);
                     }
                     dataToProcess = subset;
                 }
 
+                // Helper to record field existence and type
                 const registerField = (path, value) => {
                     const redshiftType = getRedshiftType(value);
                     if (!fieldMap.has(path)) {
                         fieldMap.set(path, { type: redshiftType, sample: value });
                     } else {
+                        // Type refinement: If we previously saw NULL, update with actual value if found.
                         const current = fieldMap.get(path);
                         if (current.sample === null && value !== null) {
                             fieldMap.set(path, { type: redshiftType, sample: value });
@@ -161,6 +227,8 @@
                     }
                 };
 
+                // Recursive Traversal: Walks down Objects and Arrays
+                // path format: "users.address.city" or "orders[].items[].price"
                 const traverse = (currentValue, currentPath) => {
                     if (currentValue === null) {
                         registerField(currentPath, null);
@@ -190,12 +258,14 @@
                     registerField(currentPath, currentValue);
                 };
 
+                // Start traversal
                 if (Array.isArray(dataToProcess)) {
                     dataToProcess.forEach(item => traverse(item, ''));
                 } else {
                     traverse(dataToProcess, '');
                 }
 
+                // Convert Map to Array for React
                 return Array.from(fieldMap.entries())
                     .filter(([field]) => field !== '') 
                     .map(([field, info]) => ({
@@ -206,6 +276,12 @@
                     }));
             };
 
+            /**
+             * Function: getArrayPaths
+             * Purpose: Identifies all nested array levels (e.g., "orders[]", "orders[].items[]").
+             * Why: In SQL, every array level represents a 1:N relationship requiring a LEFT JOIN (unnest).
+             * We sort by length so we process parents before children.
+             */
             const getArrayPaths = (schema) => {
                 if (!schema) return [];
                 const arrayPaths = new Set();
@@ -220,7 +296,7 @@
                             arrayCount++;
                         }
                         let currentBase = pathSoFar ? \`\${pathSoFar}.\${partName}\` : partName;
-                        // Iterate from 1 to arrayCount to ensure [] are appended correctly
+                        // Iterate from 1 to arrayCount to ensure nested arrays [[...]] are captured
                         for (let i = 1; i <= arrayCount; i++) {
                             let p = currentBase;
                             for (let k = 0; k < i; k++) p += "[]";
@@ -232,7 +308,7 @@
                 return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
             };
 
-            // Enhanced getValue that is robust to empty path parts
+            // Safe property access utility
             const getValue = (obj, path) => {
                 if (!path) return obj;
                 const parts = path.split('.').filter(p => p !== "");
@@ -244,6 +320,18 @@
                 return current;
             };
 
+            /**
+             * Function: generateFlattenedData
+             * THE CORE ENGINE: Converts nested JSON into flat rows (Denormalization).
+             * * Logic Overview:
+             * 1. Start with the root record as context.
+             * 2. Iterate through every array path found in the schema (e.g., "orders[]").
+             * 3. "Explode" the context: For each existing context row, find the array data.
+             * - If array has 3 items, the single context row becomes 3 rows.
+             * - If array is empty/null, keep 1 row with nulls (LEFT JOIN behavior).
+             * 4. Repeat for nested arrays (orders[].items[]) using the expanded contexts.
+             * 5. Finally, map simple fields (e.g., "orders[].id") from the specific context they belong to.
+             */
             const generateFlattenedData = (json, schema, aliases, limit) => {
                 const sortedArrays = getArrayPaths(schema);
                 const resultRows = [];
@@ -252,10 +340,15 @@
 
                 for (const record of dataToProcess) {
                     if (resultRows.length >= maxOutputRows) break;
+                    
+                    // Step 1: Initial Context
                     let contexts = [{ "": record }];
 
+                    // Step 2 & 3: Iteratively expand contexts based on array depth
                     for (const arrayPath of sortedArrays) {
                         const nextContexts = [];
+                        
+                        // Find parent array to read data from
                         let parentArrayPath = "";
                         for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
                             if (arrayPath.startsWith(sortedArrays[i])) {
@@ -269,14 +362,17 @@
                         if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
                         if (relativePath.endsWith('[]')) relativePath = relativePath.slice(0, -2);
 
+                        // Expand
                         for (const ctx of contexts) {
                             const parentData = ctx[parentArrayPath || ""];
                             let arrayData = null;
                             if (parentData) arrayData = getValue(parentData, relativePath);
 
                             if (Array.isArray(arrayData) && arrayData.length > 0) {
+                                // Explosion: 1 parent row -> N child rows
                                 for (const item of arrayData) nextContexts.push({ ...ctx, [arrayPath]: item });
                             } else {
+                                // Preservation: 1 parent row -> 1 child row (values null)
                                 nextContexts.push({ ...ctx, [arrayPath]: null });
                             }
                         }
@@ -284,11 +380,14 @@
                         if (contexts.length > maxOutputRows) break; 
                     }
 
+                    // Step 4: Map Final Values
                     for (const ctx of contexts) {
                         if (resultRows.length >= maxOutputRows) break;
                         const row = {};
                         schema.forEach(fieldItem => {
                             const fullPath = fieldItem.field;
+                            
+                            // Determine which context owns this field (deepest match)
                             let deepestArrayPath = "";
                             for (const arrayPath of sortedArrays) {
                                 if (fullPath === arrayPath || fullPath.startsWith(arrayPath + '.') || fullPath.startsWith(arrayPath + '[')) {
@@ -312,6 +411,7 @@
                 return resultRows;
             };
 
+             // Helper: Counts rows without overhead of creating objects (for "Total Records" stat)
              const calculateContextCount = (contexts, arrayPath, sortedArrays) => {
                   const nextContexts = [];
                   let parentArrayPath = "";
@@ -353,9 +453,11 @@
                 return totalCount;
             };
 
+            // Main Message Bus
             self.onmessage = function(e) {
                 const { type, payload } = e.data;
                 if (type === 'PROCESS_FILE') {
+                    // Logic: Parse -> Infer Schema -> Return
                     try {
                         const { text, useSampling } = payload;
                         self.postMessage({ type: 'PROGRESS', payload: { status: 'Parsing JSON...', percent: 30 } });
@@ -368,6 +470,7 @@
                         self.postMessage({ type: 'ERROR', payload: err.message });
                     }
                 } else if (type === 'FLATTEN_DATA') {
+                    // Logic: Run Flattening Engine
                     try {
                         const { json, schema, aliases, limit } = payload;
                         const flatData = generateFlattenedData(json, schema, aliases, limit);
@@ -376,6 +479,7 @@
                         self.postMessage({ type: 'ERROR', payload: "Flattening failed: " + err.message });
                     }
                 } else if (type === 'CALC_TOTAL_ROWS') {
+                     // Logic: Run Counting Engine
                      try {
                           const { json, schema } = payload;
                           const count = countTotalRows(json, schema);
@@ -387,6 +491,7 @@
 
         // --- Custom Reusable Components ---
 
+        // Simple Tooltip component using group-hover CSS
         const Tooltip = ({ content, children, position = 'top', disabled = false }) => {
           if (disabled || !content) return <>{children}</>;
           const positions = {
@@ -406,6 +511,7 @@
         };
 
         // --- Helper: useDebounce ---
+        // Delays state updates (like search terms) to prevent lags on every keystroke
         function useDebounce(value, delay) {
           const [debouncedValue, setDebouncedValue] = useState(value);
           useEffect(() => {
@@ -415,14 +521,15 @@
           return debouncedValue;
         }
 
-        // --- Worker Creation ---
+        // --- Worker Creation Helper ---
         const createWorker = () => {
             const blob = new Blob([WORKER_CODE], { type: "application/javascript" });
             return new Worker(URL.createObjectURL(blob));
         };
 
-        // --- SQL Generation Logic ---
+        // --- SQL Generation Logic (View & Table DDL) ---
         
+        // Re-implementing array path logic here for main thread synchronous use
         const getArrayPaths = (schema) => {
             if (!schema) return [];
             const arrayPaths = new Set();
@@ -448,12 +555,20 @@
             return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
         };
 
+        /**
+         * Function: generateUniqueAliases
+         * Purpose: Ensures that every column in the output SQL has a unique, safe name.
+         * Logic: 
+         * - If `user.id` and `order.id` both exist, simply using "id" is ambiguous.
+         * - It tries "id", then "user_id", then "user_id_2" until a unique name is found.
+         */
         const generateUniqueAliases = (schema, columnAliases) => {
             const usedAliases = new Set();
             const aliasMap = {}; 
             if (!schema) return {};
 
             schema.forEach(item => {
+                // Return explicitly set alias if exists (user override)
                 if (columnAliases[item.field]) {
                     aliasMap[item.field] = columnAliases[item.field];
                     usedAliases.add(columnAliases[item.field]);
@@ -461,6 +576,8 @@
                 }
                 const cleanPath = item.field.replace(/\[\]/g, '');
                 const parts = cleanPath.split('.');
+                // Heuristic: start with just the last part (e.g. "city")
+                // If conflict, prepend previous part (e.g. "address_city")
                 let startIdx = Math.max(1, parts.length - 2); 
                 if (parts.length === 1) startIdx = 0;
                 let foundUnique = false;
@@ -475,6 +592,7 @@
                         break;
                     }
                 }
+                // Fallback: append numbers
                 if (!foundUnique) {
                     let counter = 2;
                     while (usedAliases.has(`${candidate}_${counter}`)) {
@@ -493,6 +611,14 @@
             return `t${index + 1}_${name ? name.replace(/[^a-zA-Z0-9]/g, '') : 'tbl'}`;
         };
 
+        /**
+         * Function: generateSqlScript
+         * Purpose: Generates the CREATE VIEW script.
+         * Key Logic:
+         * - Uses standard SQL JSON extraction (dot notation).
+         * - Generates LEFT JOIN ... ON TRUE for array unnesting.
+         * - Applies CAST for data types inferred by the worker.
+         */
         const generateSqlScript = (schema, tableAliases = {}, columnAliases = {}, config = {}) => {
             if (!schema || schema.length === 0) return "-- No schema detected.";
             
@@ -509,6 +635,7 @@
             });
             const smartColAliases = generateUniqueAliases(schema, columnAliases);
             
+            // Build SELECT clause
             const selectLines = schema.map(item => {
                 let deepestArrayPath = "";
                 for (const arrayPath of sortedArrays) {
@@ -528,6 +655,7 @@
                 
                 let selection;
                 
+                // Dot notation logic for JSON extraction
                 if (deepestArrayPath === "") {
                      selection = cleanRelative ? `"${parentAlias}"."${jsonColumn}".${cleanRelative.split('.').map(p=>`"${p}"`).join('.')}` : `"${parentAlias}"."${jsonColumn}"`;
                 } else {
@@ -543,9 +671,9 @@
                 return `    CAST(${selection} AS ${castType}) AS "${colAlias}"`;
             });
             
-            // Removed double quotes around sourceTable
             let fromClause = `FROM\n    ${sourceTable} AS "${aliases[""] || "src"}"`;
             
+            // Build JOIN clauses for arrays (Iterative Unnesting)
             sortedArrays.forEach((arrayPath) => {
                 const alias = aliases[arrayPath];
                 let parentArrayPath = "";
@@ -640,6 +768,7 @@
             }
         });
 
+        // Highlights SQL syntax for the script preview
         const HighlightSql = React.memo(({ code, searchTerm }) => {
             const keywords = /\b(SELECT|FROM|WHERE|CAST|AS|LEFT|JOIN|ON|CREATE|OR|REPLACE|VIEW|WITH|NO|SCHEMA|BINDING|GRANT|TO|GROUP|TRUE|FALSE|NULL|TABLE|DISTSTYLE|SORTKEY|DISTKEY|AUTO)\b/gi;
             const types = /\b(VARCHAR|BIGINT|SMALLINT|INTEGER|DECIMAL|REAL|DOUBLE PRECISION|CHAR|TEXT|DATE|TIMESTAMP|TIMESTAMPTZ|BOOLEAN|SUPER|GEOMETRY|VARBYTE)\b/gi;
@@ -676,6 +805,7 @@
             );
         });
 
+        // Formats field paths, highlighting array brackets
         const FormattedField = React.memo(({ path, searchTerm }) => {
           const parts = path.split('.');
           return (
@@ -700,6 +830,7 @@
           );
         });
 
+        // Dropdown for selecting data types
         const DataTypeSelect = React.memo(({ value, originalType, onChange }) => {
           const [isOpen, setIsOpen] = useState(false);
           const [isCustomMode, setIsCustomMode] = useState(false);
@@ -834,6 +965,7 @@
           );
         });
 
+        // Tag input for Sort Keys
         const SortKeySelector = ({ availableColumns, value, onChange }) => {
             const [inputValue, setInputValue] = useState("");
             const [showSuggestions, setShowSuggestions] = useState(false);
@@ -968,6 +1100,7 @@
           );
         });
 
+        // Recursive component for Tree View
         const JsonNode = React.memo(({ name, value, isLast, depth = 0, expandSignal, searchTerm }) => {
           const [isExpanded, setIsExpanded] = useState(false);
           const [showAllItems, setShowAllItems] = useState(false);
@@ -1089,11 +1222,15 @@
         });
 
         // --- Data Preview Component (Virtualized) ---
+        // Renders only visible rows to handle large datasets efficiently.
+        // Concept: A large empty div sets the scroll height, and a smaller absolutely positioned
+        // table renders just the subset of rows currently in the viewport.
         const DataPreview = ({ data, columns }) => {
             const parentRef = useRef(null);
             const [scrollTop, setScrollTop] = useState(0);
             const [containerHeight, setContainerHeight] = useState(0);
 
+            // Observe container resize to update virtualization calcs
             useEffect(() => {
                 if (!parentRef.current) return;
                 const resizeObserver = new ResizeObserver(entries => {
@@ -1118,16 +1255,14 @@
 
             if (!data || data.length === 0) return <div className="p-8 text-center text-slate-400">No data available. Check your schema selection.</div>;
 
+            // Virtualization Math
             const rowHeight = 35; // Fixed height for rows
             const headerHeight = 40; // Height of the sticky header
-            
-            // Render first few rows immediately even if containerHeight is 0 to avoid blank screen
             const effectiveHeight = containerHeight || 500;
-            
             const totalRows = data.length;
             const visibleRows = Math.ceil(effectiveHeight / rowHeight);
             
-            // Account for header height in scroll position
+            // Calculate indices
             const scrollOffset = Math.max(0, scrollTop - headerHeight);
             const startIndex = Math.max(0, Math.floor(scrollOffset / rowHeight) - 2); // Buffer
             const endIndex = Math.min(totalRows, startIndex + visibleRows + 20); // Increased Buffer
@@ -1184,6 +1319,7 @@
             );
         };
 
+        // Reconstructs a hierarchical tree from a flat list of paths
         const buildSchemaTree = (flatSchema) => {
             const root = { name: 'root', children: {}, items: [] };
             flatSchema.forEach(item => {
@@ -1215,6 +1351,9 @@
         };
 
         // --- Optimized SchemaView with Virtualization ---
+        // A complex component that renders the schema as a tree table.
+        // It supports bulk selection, type editing, and renaming.
+        // It uses the same virtualization technique as DataPreview.
         const SchemaRow = React.memo(({ item, type, depth, onTypeChange, searchTerm, onSelect, isSelected, columnAliases, onColumnAliasChange, isExcluded, onToggle, isExpanded, selectionState, effectiveAliases }) => {
             const currentAlias = columnAliases[item.field || item.path] || "";
             const isNode = type === 'node';
@@ -1222,7 +1361,7 @@
             // Only leaves have selection and type change
             const canSelect = !isNode;
             
-            // Indentation
+            // Visual Indentation for Tree Structure
             const paddingLeft = depth * 20 + 8;
             
             const handleSelectChange = () => {
@@ -1258,7 +1397,7 @@
 
                     {/* Field Name Column */}
                     <div className="flex-1 flex items-center h-full min-w-[200px] overflow-hidden px-2 relative">
-                         {/* Guide lines */}
+                         {/* Guide lines for Tree depth */}
                          {Array.from({ length: depth }).map((_, i) => (
                             <div 
                                 key={i} 
@@ -1334,6 +1473,7 @@
             const [scrollTop, setScrollTop] = useState(0);
             const [containerHeight, setContainerHeight] = useState(0);
 
+            // Resize observer to handle dynamic container height for virtualization
             useEffect(() => {
                 if (!parentRef.current) return;
                 const resizeObserver = new ResizeObserver(entries => {
@@ -1381,6 +1521,7 @@
                 }
             }, [expandSignal, schema]);
 
+            // Memoized Flattening Logic: Converts tree to flat list for virtualization
             const flatRows = useMemo(() => {
                 if (!schema) return [];
                 const treeRoot = buildSchemaTree(schema);
@@ -1391,6 +1532,7 @@
                          rows.push({ type: 'node', data: node, depth });
                     }
                     
+                    // Only traverse children if node is expanded OR if we are searching (search shows deep matches)
                     if (node.name === 'root' || expandedPaths.has(node.path) || searchTerm) {
                          node.items.forEach(item => {
                              // Inject effective alias into item data for row to use
@@ -1415,7 +1557,8 @@
                 return rows;
             }, [schema, expandedPaths, searchTerm, effectiveAliases]);
 
-            // Corrected Logic: Calculate all filterable leaf items independent of view state (expansion)
+            // Logic: Calculate all filterable leaf items independent of view state (expansion)
+            // This ensures the "Select All" checkbox selects hidden items too.
             const allFilteredLeaves = useMemo(() => {
                 if (!schema) return [];
                 if (!searchTerm) return schema;
@@ -1437,6 +1580,7 @@
 
             if (!schema) return <div className="text-gray-500 p-4">No data to analyze.</div>;
 
+            // Virtualization Props
             const rowHeight = 35;
             const effectiveHeight = containerHeight || 500;
             const totalRows = flatRows.length;
@@ -1694,23 +1838,29 @@
           const [loading, setLoading] = useState(false);
           const [loadingProgress, setLoadingProgress] = useState({ status: '', percent: 0 });
           
+          // State for file parsing & view modes
           const [isArrayMode, setIsArrayMode] = useState(false);
           const [currentPage, setCurrentPage] = useState(0);
           const [totalPages, setTotalPages] = useState(0);
+          
+          // Signals for expanding/collapsing tree nodes (broadcast events)
           const [expandSignal, setExpandSignal] = useState(null);
           const [schemaExpandSignal, setSchemaExpandSignal] = useState(null);
           
+          // Schema & Selection State
           const [schemaData, setSchemaData] = useState(null);
           const [tableAliases, setTableAliases] = useState({}); 
           const [columnAliases, setColumnAliases] = useState({});
           const [excludedFields, setExcludedFields] = useState(new Set()); 
           const [selectedFields, setSelectedFields] = useState(new Set());
+          
+          // UI State
           const [searchTerm, setSearchTerm] = useState(''); 
           const [isDarkMode, setIsDarkMode] = useState(false); 
-          const [viewMode, setViewMode] = useState('tree');
+          const [viewMode, setViewMode] = useState('tree'); // 'tree' | 'schema' | 'script'
           const [useSampling, setUseSampling] = useState(true); 
           const [flattenedData, setFlattenedData] = useState(null);
-          const [previewMode, setPreviewMode] = useState('json');
+          const [previewMode, setPreviewMode] = useState('json'); // 'json' | 'table'
           const [previewLimit, setPreviewLimit] = useState(true); // Toggle state: true = 100 limit, false = 5000 limit
           const [totalRecords, setTotalRecords] = useState(null);
 
@@ -1719,12 +1869,14 @@
           const debouncedSearchTerm = useDebounce(searchTerm, 300);
           const fileInputRef = useRef(null);
           
+          // Filter schema based on exclusions
           const activeSchema = useMemo(() => {
               if (!schemaData) return null;
               if (excludedFields.size === 0) return schemaData;
               return schemaData.filter(item => !excludedFields.has(item.field));
           }, [schemaData, excludedFields]);
 
+          // Recalculate aliases when schema changes or user edits aliases
           const effectiveAliases = useMemo(() => generateUniqueAliases(activeSchema, columnAliases), [activeSchema, columnAliases]);
 
           const allSelectedAreExcluded = useMemo(() => {
@@ -1732,6 +1884,7 @@
               return selectedCount > 0 && Array.from(selectedFields).every(f => excludedFields.has(f));
           }, [selectedFields, excludedFields]);
 
+          // Dark Mode Toggle Effect
           useEffect(() => {
             if (isDarkMode) document.documentElement.classList.add('dark');
             else document.documentElement.classList.remove('dark');
@@ -2062,6 +2215,7 @@
                     </div>
                 )}
 
+                {/* File Upload Zone */}
                 {!json && (
                   <div 
                     className={`flex-1 flex flex-col items-center justify-center relative border-2 border-dashed rounded-xl p-6 md:p-12 text-center transition-all duration-300 ease-in-out cursor-pointer ${isDragging ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 scale-[1.01]' : 'border-slate-300 dark:border-slate-700 hover:border-blue-400 dark:hover:border-blue-500 bg-white dark:bg-slate-800 shadow-sm'}`} 
@@ -2099,6 +2253,7 @@
                   </div>
                 )}
 
+                {/* Main Dashboard (Visible after file load) */}
                 {json && (
                   <div className="flex-1 flex flex-row min-h-0 animate-in fade-in slide-in-from-bottom-8 duration-500 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700 shadow-sm bg-white dark:bg-slate-800">
                     {/* Sidebar with Vertical Tabs */}
@@ -2150,7 +2305,7 @@
 
                     {/* Main Content Area */}
                     <div className="flex-1 flex flex-col min-w-0 bg-white dark:bg-slate-800">
-                        {/* Header Toolbar */}
+                        {/* Header Toolbar (Search, Pagination, Actions) */}
                         <div className="flex-none h-12 flex items-center justify-between px-4 border-b border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800">
                             <div className="flex items-center text-sm text-slate-500 flex-1">
                                 {viewMode === 'schema' && selectedFields.size > 0 ? (
@@ -2238,6 +2393,7 @@
                                 )}
                             </div>
                             <div className="flex items-center gap-2">
+                                {/* Pagination Controls (only visible in Tree View) */}
                                 {isArrayMode && viewMode === 'tree' && previewMode === 'json' && (
                                     <div className="flex items-center gap-2 mr-4 bg-slate-50 dark:bg-slate-700/50 rounded-lg p-1 border border-slate-200 dark:border-slate-600">
                                         <Tooltip content="Previous" position="bottom">
@@ -2269,17 +2425,20 @@
                             </div>
                         </div>
 
-                        {/* Viewports */}
+                        {/* Viewports (Tab Content) */}
                         <div className="flex-1 relative min-h-0 bg-slate-50/30 dark:bg-slate-900/10">
+                            {/* Tree View (JSON) */}
                             <div className={`absolute inset-0 p-6 overflow-auto ${viewMode === 'tree' && previewMode === 'json' ? 'block' : 'hidden'}`}>
                                 <JsonNode key={`${fileInfo?.name}-${currentPage}`} name={null} value={displayData} isLast={true} expandSignal={expandSignal} searchTerm={debouncedSearchTerm} />
                             </div>
+                            {/* Flattened Table View */}
                             <div className={`absolute inset-0 ${viewMode === 'tree' && previewMode === 'table' ? 'block' : 'hidden'}`}>
                                 <DataPreview 
                                     data={flattenedData}
                                     columns={Object.values(effectiveAliases)}
                                 />
                             </div>
+                            {/* Schema Editor */}
                             <div className={`absolute inset-0 overflow-auto ${viewMode === 'schema' ? 'block' : 'hidden'}`}>
                                 <SchemaView 
                                     schema={schemaData} 
@@ -2297,6 +2456,7 @@
                                     onSelectAll={handleSelectAll}
                                 />
                             </div>
+                            {/* SQL Script View */}
                             <div className={`absolute inset-0 ${viewMode === 'script' ? 'block' : 'hidden'}`}>
                                 <ScriptView 
                                     schema={activeSchema} 
