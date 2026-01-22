@@ -138,6 +138,10 @@
         const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
         const MAX_ITEMS_PREVIEW = 20; 
         const MAX_STRING_LENGTH = 100;
+        
+        // Internal Separator used to prevent collision with keys that contain dots.
+        // We use § (Section Sign) because it is rare in JSON keys.
+        const PATH_SEP = '§';
 
         // SQL Data Type Mappings
         // These are standard types used in AWS Redshift, Postgres, and Snowflake.
@@ -161,6 +165,8 @@
          * * This string is converted to a Blob and executed in a separate thread.
          */
         const WORKER_CODE = `
+            const PATH_SEP = '§';
+
             /**
              * Function: getRedshiftType
              * Purpose: Analyzes a JS value and guesses the most appropriate SQL type.
@@ -229,6 +235,7 @@
 
                 // Recursive Traversal: Walks down Objects and Arrays
                 // path format: "users.address.city" or "orders[].items[].price"
+                // uses PATH_SEP instead of dot to handle keys containing dots
                 const traverse = (currentValue, currentPath) => {
                     if (currentValue === null) {
                         registerField(currentPath, null);
@@ -239,7 +246,7 @@
                             registerField(currentPath, []); 
                             return;
                         }
-                        const nextPathBase = currentPath ? \`\${currentPath}[]\` : ''; 
+                        const nextPathBase = currentPath ? \`\${currentPath}\${PATH_SEP}[]\` : ''; 
                         currentValue.forEach(item => traverse(item, nextPathBase));
                         return;
                     }
@@ -250,7 +257,7 @@
                             return;
                         }
                         keys.forEach(key => {
-                            const nextPath = currentPath ? \`\${currentPath}.\${key}\` : key;
+                            const nextPath = currentPath ? \`\${currentPath}\${PATH_SEP}\${key}\` : key;
                             traverse(currentValue[key], nextPath);
                         });
                         return;
@@ -286,7 +293,7 @@
                 if (!schema) return [];
                 const arrayPaths = new Set();
                 schema.forEach(item => {
-                    const parts = item.field.split('.');
+                    const parts = item.field.split(PATH_SEP);
                     let pathSoFar = "";
                     parts.forEach(part => {
                         let partName = part;
@@ -295,23 +302,23 @@
                             partName = partName.slice(0, -2);
                             arrayCount++;
                         }
-                        let currentBase = pathSoFar ? \`\${pathSoFar}.\${partName}\` : partName;
+                        let currentBase = pathSoFar ? \`\${pathSoFar}\${PATH_SEP}\${partName}\` : partName;
                         // Iterate from 1 to arrayCount to ensure nested arrays [[...]] are captured
                         for (let i = 1; i <= arrayCount; i++) {
                             let p = currentBase;
                             for (let k = 0; k < i; k++) p += "[]";
                             arrayPaths.add(p);
                         }
-                        pathSoFar = pathSoFar ? \`\${pathSoFar}.\${part}\` : part;
+                        pathSoFar = pathSoFar ? \`\${pathSoFar}\${PATH_SEP}\${part}\` : part;
                     });
                 });
                 return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
             };
 
-            // Safe property access utility
+            // Safe property access utility with custom separator
             const getValue = (obj, path) => {
                 if (!path) return obj;
-                const parts = path.split('.').filter(p => p !== "");
+                const parts = path.split(PATH_SEP).filter(p => p !== "");
                 let current = obj;
                 for (let part of parts) {
                     if (current === null || current === undefined) return null;
@@ -359,7 +366,7 @@
 
                         let relativePath = arrayPath;
                         if (parentArrayPath) relativePath = arrayPath.substring(parentArrayPath.length);
-                        if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
+                        if (relativePath.startsWith(PATH_SEP)) relativePath = relativePath.substring(1);
                         if (relativePath.endsWith('[]')) relativePath = relativePath.slice(0, -2);
 
                         // Expand
@@ -390,7 +397,7 @@
                             // Determine which context owns this field (deepest match)
                             let deepestArrayPath = "";
                             for (const arrayPath of sortedArrays) {
-                                if (fullPath === arrayPath || fullPath.startsWith(arrayPath + '.') || fullPath.startsWith(arrayPath + '[')) {
+                                if (fullPath === arrayPath || fullPath.startsWith(arrayPath + PATH_SEP) || fullPath.startsWith(arrayPath + '[')) {
                                     if (arrayPath.length > deepestArrayPath.length) deepestArrayPath = arrayPath;
                                 }
                             }
@@ -400,7 +407,7 @@
                                 let relativePath = fullPath;
                                 if (deepestArrayPath) relativePath = fullPath.substring(deepestArrayPath.length);
                                 
-                                value = getValue(contextObj, relativePath.replace(/\\[\\]/g, ''));
+                                value = getValue(contextObj, relativePath.replace(new RegExp('\\\\\\\\' + PATH_SEP, 'g'), ''));
                             }
                             const header = aliases[fullPath] || fullPath;
                             row[header] = (value !== null && typeof value === 'object') ? JSON.stringify(value) : value;
@@ -423,7 +430,7 @@
                   }
                   let relativePath = arrayPath;
                   if (parentArrayPath) relativePath = arrayPath.substring(parentArrayPath.length);
-                  if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
+                  if (relativePath.startsWith(PATH_SEP)) relativePath = relativePath.substring(1);
                   if (relativePath.endsWith('[]')) relativePath = relativePath.slice(0, -2);
 
                   for (const ctx of contexts) {
@@ -534,7 +541,7 @@
             if (!schema) return [];
             const arrayPaths = new Set();
             schema.forEach(item => {
-                const parts = item.field.split('.');
+                const parts = item.field.split(PATH_SEP);
                 let pathSoFar = "";
                 parts.forEach(part => {
                     let partName = part;
@@ -543,13 +550,13 @@
                         partName = partName.slice(0, -2);
                         arrayCount++;
                     }
-                    let currentBase = pathSoFar ? `${pathSoFar}.${partName}` : partName;
+                    let currentBase = pathSoFar ? `${pathSoFar}${PATH_SEP}${partName}` : partName;
                     for (let i = 0; i < arrayCount; i++) {
                         let p = currentBase;
                         for (let k = 0; k < i; k++) p += "[]";
                         arrayPaths.add(p);
                     }
-                    pathSoFar = pathSoFar ? `${pathSoFar}.${part}` : part;
+                    pathSoFar = pathSoFar ? `${pathSoFar}${PATH_SEP}${part}` : part;
                 });
             });
             return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
@@ -575,7 +582,7 @@
                     return;
                 }
                 const cleanPath = item.field.replace(/\[\]/g, '');
-                const parts = cleanPath.split('.');
+                const parts = cleanPath.split(PATH_SEP);
                 // Heuristic: start with just the last part (e.g. "city")
                 // If conflict, prepend previous part (e.g. "address_city")
                 let startIdx = Math.max(1, parts.length - 2); 
@@ -607,7 +614,7 @@
         };
 
         const getDefaultTableAlias = (path, index) => {
-            const name = path.split('.').pop();
+            const name = path.split(PATH_SEP).pop();
             return `t${index + 1}_${name ? name.replace(/[^a-zA-Z0-9]/g, '') : 'tbl'}`;
         };
 
@@ -639,7 +646,7 @@
             const selectLines = schema.map(item => {
                 let deepestArrayPath = "";
                 for (const arrayPath of sortedArrays) {
-                    if (item.field === arrayPath || item.field.startsWith(arrayPath + '.') || item.field.startsWith(arrayPath + '[')) {
+                    if (item.field === arrayPath || item.field.startsWith(arrayPath + PATH_SEP) || item.field.startsWith(arrayPath + '[')) {
                          if (arrayPath.length > deepestArrayPath.length) deepestArrayPath = arrayPath;
                     }
                 }
@@ -651,18 +658,21 @@
                 }
                 
                 let cleanRelative = relativePath.replace(/\[\]/g, '');
-                if (cleanRelative.startsWith('.')) cleanRelative = cleanRelative.substring(1);
+                if (cleanRelative.startsWith(PATH_SEP)) cleanRelative = cleanRelative.substring(1);
                 
                 let selection;
                 
                 // Dot notation logic for JSON extraction
+                // Note: We use the PARTS split by PATH_SEP but join them with SQL dots
+                const parts = cleanRelative ? cleanRelative.split(PATH_SEP) : [];
+
                 if (deepestArrayPath === "") {
-                     selection = cleanRelative ? `"${parentAlias}"."${jsonColumn}".${cleanRelative.split('.').map(p=>`"${p}"`).join('.')}` : `"${parentAlias}"."${jsonColumn}"`;
+                     selection = parts.length > 0 ? `"${parentAlias}"."${jsonColumn}".${parts.map(p=>`"${p}"`).join('.')}` : `"${parentAlias}"."${jsonColumn}"`;
                 } else {
-                     if (!cleanRelative) {
+                     if (parts.length === 0) {
                          selection = `"${parentAlias}"`;
                      } else {
-                         selection = `"${parentAlias}".${cleanRelative.split('.').map(p=>`"${p}"`).join('.')}`;
+                         selection = `"${parentAlias}".${parts.map(p=>`"${p}"`).join('.')}`;
                      }
                 }
 
@@ -691,7 +701,7 @@
                 if (parentArrayPath) {
                     relativePath = arrayPath.substring(parentArrayPath.length);
                 }
-                if (relativePath.startsWith('.')) relativePath = relativePath.substring(1);
+                if (relativePath.startsWith(PATH_SEP)) relativePath = relativePath.substring(1);
                 
                 let joinExpr;
                 
@@ -699,12 +709,13 @@
                     joinExpr = `"${parentAlias}"`;
                 } else {
                     let cleanProp = relativePath.replace(/\[\]/g, '');
-                    if (cleanProp.startsWith('.')) cleanProp = cleanProp.substring(1);
+                    if (cleanProp.startsWith(PATH_SEP)) cleanProp = cleanProp.substring(1);
+                    const parts = cleanProp ? cleanProp.split(PATH_SEP) : [];
 
                     if (parentArrayPath === "") {
-                        joinExpr = `"${parentAlias}"."${jsonColumn}".${cleanProp.split('.').map(p=>`"${p}"`).join('.')}`;
+                        joinExpr = `"${parentAlias}"."${jsonColumn}".${parts.map(p=>`"${p}"`).join('.')}`;
                     } else {
-                        joinExpr = `"${parentAlias}".${cleanProp.split('.').map(p=>`"${p}"`).join('.')}`;
+                        joinExpr = `"${parentAlias}".${parts.map(p=>`"${p}"`).join('.')}`;
                     }
                 }
                 
@@ -807,7 +818,7 @@
 
         // Formats field paths, highlighting array brackets
         const FormattedField = React.memo(({ path, searchTerm }) => {
-          const parts = path.split('.');
+          const parts = path.split(PATH_SEP);
           return (
             <span className="inline-flex flex-wrap items-baseline gap-0.5">
               {parts.map((part, index) => {
@@ -1323,7 +1334,7 @@
         const buildSchemaTree = (flatSchema) => {
             const root = { name: 'root', children: {}, items: [] };
             flatSchema.forEach(item => {
-                const pathParts = item.field.split('.');
+                const pathParts = item.field.split(PATH_SEP);
                 let currentNode = root;
                 for (let i = 0; i < pathParts.length; i++) {
                     const part = pathParts[i];
@@ -1334,7 +1345,7 @@
                         currentNode.items.push({ ...item, displayName, isArray });
                     } else {
                         if (!currentNode.children[displayName]) {
-                            currentNode.children[displayName] = { name: displayName, children: {}, items: [], isArray: isArray, path: pathParts.slice(0, i+1).join('.') };
+                            currentNode.children[displayName] = { name: displayName, children: {}, items: [], isArray: isArray, path: pathParts.slice(0, i+1).join(PATH_SEP) };
                         }
                         currentNode = currentNode.children[displayName];
                     }
@@ -1411,6 +1422,7 @@
                                 <div 
                                     className="flex items-center gap-2 cursor-pointer select-none group/toggle text-slate-700 dark:text-slate-200 font-semibold text-sm hover:text-blue-600 dark:hover:text-blue-400"
                                     onClick={() => onToggle(item.path)}
+                                    title={item.name}
                                 >
                                     <span className="w-5 h-5 flex items-center justify-center text-slate-400">
                                         {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
@@ -1421,7 +1433,10 @@
                                     </span>
                                 </div>
                             ) : (
-                                <div className="flex items-center gap-2 text-sm font-mono text-purple-700 dark:text-purple-400 truncate pl-6 relative">
+                                <div 
+                                    className="flex items-center gap-2 text-sm font-mono text-purple-700 dark:text-purple-400 truncate pl-6 relative"
+                                    title={item.displayName || item.field}
+                                >
                                      <span className="text-slate-300 dark:text-slate-600 absolute left-1 top-1/2 -translate-y-1/2">└</span>
                                      <FormattedField path={item.displayName || item.field} searchTerm={searchTerm} />
                                 </div>
@@ -1441,7 +1456,7 @@
                     </div>
                     
                     {/* Alias Column */}
-                    <div className="w-[25%] min-w-[150px] flex items-center px-2 h-full">
+                    <div className="w-[25%] min-w-[140px] flex items-center px-2 h-full">
                          {!isNode && (
                             <input 
                                 type="text" 
@@ -1452,6 +1467,10 @@
                                     if (!currentAlias) {
                                          onColumnAliasChange({...columnAliases, [item.field]: placeholder});
                                     }
+                                    const target = e.target;
+                                    setTimeout(() => {
+                                        target.setSelectionRange(target.value.length, target.value.length);
+                                    }, 0);
                                 }}
                                 onChange={(e) => onColumnAliasChange({...columnAliases, [item.field]: e.target.value})}
                                 className="w-full px-2 py-1 text-sm md:text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded focus:ring-2 focus:ring-blue-500 outline-none text-blue-700 dark:text-blue-300 font-mono placeholder:text-slate-400 disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed h-[26px]"
@@ -1460,7 +1479,7 @@
                     </div>
                     
                     {/* Sample Column */}
-                    <div className="w-[20%] min-w-[150px] flex items-center px-2 h-full text-xs text-slate-500 font-mono truncate border-l border-slate-100 dark:border-slate-800">
+                    <div className="w-[20%] min-w-[100px] flex items-center px-2 h-full text-xs text-slate-500 font-mono truncate border-l border-slate-100 dark:border-slate-800">
                         {!isNode && JSON.stringify(item.sample)}
                     </div>
                 </div>
@@ -1613,8 +1632,8 @@
                          </div>
                          <div className="flex-1 px-2 uppercase tracking-wider">Field Name</div>
                          <div className="w-[15%] min-w-[120px] px-2 uppercase tracking-wider">Type</div>
-                         <div className="w-[25%] min-w-[150px] px-2 uppercase tracking-wider">Column name</div>
-                         <div className="w-[20%] min-w-[150px] px-2 uppercase tracking-wider">Sample</div>
+                         <div className="w-[25%] min-w-[140px] px-2 uppercase tracking-wider">Column name</div>
+                         <div className="w-[20%] min-w-[100px] px-2 uppercase tracking-wider">Sample</div>
                     </div>
                     
                     {/* Virtualized Body */}
