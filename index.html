@@ -1400,6 +1400,40 @@
             return fields;
         };
 
+        const collectMatchingNodeFields = (node, searchTerm, effectiveAliases) => {
+            let fields = [];
+            
+            // If no search term, collect all fields (standard behavior)
+            if (!searchTerm) {
+                if (node.items) node.items.forEach(i => fields.push(i.field));
+                if (node.children) Object.values(node.children).forEach(child => fields.push(...collectMatchingNodeFields(child, searchTerm, effectiveAliases)));
+                return fields;
+            }
+
+            const lowerTerm = searchTerm.toLowerCase();
+
+            // Check match for specific item
+            const isMatch = (item) => {
+                 const alias = effectiveAliases && effectiveAliases[item.field] ? effectiveAliases[item.field] : "";
+                 return item.field.toLowerCase().includes(lowerTerm) || 
+                        item.type.toLowerCase().includes(lowerTerm) ||
+                        alias.toLowerCase().includes(lowerTerm);
+            }
+
+            if (node.items) {
+                node.items.forEach(i => {
+                    if (isMatch(i)) fields.push(i.field);
+                });
+            }
+            
+            if (node.children) {
+                Object.values(node.children).forEach(child => {
+                    fields.push(...collectMatchingNodeFields(child, searchTerm, effectiveAliases));
+                });
+            }
+            return fields;
+        };
+
         // --- Optimized SchemaView with Virtualization ---
         // A complex component that renders the schema as a tree table.
         // It supports bulk selection, type editing, and renaming.
@@ -1416,7 +1450,8 @@
             
             const handleSelectChange = () => {
                 if (isNode) {
-                    const fields = collectNodeFields(item);
+                    // Use filtered collection to only select visible items
+                    const fields = collectMatchingNodeFields(item, searchTerm, effectiveAliases);
                     // Toggle: if currently fully selected (all), deselect all. Otherwise select all.
                     onSelect(fields, selectionState !== 'all'); 
                 } else {
@@ -1425,10 +1460,14 @@
             };
 
             const placeholder = isNode ? "" : (effectiveAliases[item.field] || "Alias");
+
+            // Define visual style for excluded content columns (excludes checkbox)
+            const excludedStyle = isExcluded ? 'opacity-40 grayscale' : '';
             
             return (
                 <div 
-                    className={`flex items-center border-b border-slate-100 dark:border-slate-800 h-[35px] hover:bg-slate-50 dark:hover:bg-slate-800/30 transition-colors group ${isSelected || (isNode && selectionState === 'all') ? 'bg-blue-50/50 dark:bg-blue-900/20' : ''} ${isExcluded ? 'opacity-40 grayscale decoration-slate-400' : ''}`}
+                    // Removed global opacity/grayscale class here so checkbox stays clear
+                    className={`flex items-center border-b border-slate-100 dark:border-slate-800 h-[35px] hover:bg-slate-50 dark:hover:bg-slate-800/30 transition-colors group ${isSelected || (isNode && selectionState === 'all') ? 'bg-blue-50/50 dark:bg-blue-900/20' : ''}`}
                 >
                     {/* Checkbox Column */}
                     <div className="w-10 flex-shrink-0 flex items-center justify-center border-r border-slate-100 dark:border-slate-800 h-full bg-slate-50/30 dark:bg-slate-800/10">
@@ -1445,8 +1484,8 @@
                          </div>
                     </div>
 
-                    {/* Field Name Column */}
-                    <div className="flex-1 flex items-center h-full min-w-[200px] overflow-hidden px-2 relative">
+                    {/* Field Name Column - Applied excludedStyle */}
+                    <div className={`flex-1 flex items-center h-full min-w-[200px] overflow-hidden px-2 relative ${excludedStyle}`}>
                          {/* Guide lines for Tree depth */}
                          {Array.from({ length: depth }).map((_, i) => (
                             <div 
@@ -1483,8 +1522,8 @@
                         </div>
                     </div>
 
-                    {/* Type Column */}
-                    <div className="w-[15%] min-w-[120px] flex items-center px-2 h-full">
+                    {/* Type Column - Applied excludedStyle */}
+                    <div className={`w-[15%] min-w-[120px] flex items-center px-2 h-full ${excludedStyle}`}>
                         {isNode ? (
                             item.isArray && <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">Array</span>
                         ) : (
@@ -1494,8 +1533,8 @@
                         )}
                     </div>
                     
-                    {/* Alias Column */}
-                    <div className="w-[25%] min-w-[140px] flex items-center px-2 h-full">
+                    {/* Alias Column - Applied excludedStyle */}
+                    <div className={`w-[25%] min-w-[140px] flex items-center px-2 h-full ${excludedStyle}`}>
                          {!isNode && (
                             <input 
                                 type="text" 
@@ -1523,8 +1562,8 @@
                          )}
                     </div>
                     
-                    {/* Sample Column */}
-                    <div className="w-[20%] min-w-[100px] flex items-center px-2 h-full text-xs text-slate-500 font-mono truncate border-l border-slate-100 dark:border-slate-800">
+                    {/* Sample Column - Applied excludedStyle */}
+                    <div className={`w-[20%] min-w-[100px] flex items-center px-2 h-full text-xs text-slate-500 font-mono truncate border-l border-slate-100 dark:border-slate-800 ${excludedStyle}`}>
                         {!isNode && JSON.stringify(item.sample)}
                     </div>
                 </div>
@@ -1661,7 +1700,8 @@
 
             // Helper to calculate node selection state for the row
             const getNodeSelectionState = (node) => {
-                const fields = collectNodeFields(node);
+                // Use filtered collection to determine state based on visible items
+                const fields = collectMatchingNodeFields(node, searchTerm, effectiveAliases);
                 if (fields.length === 0) return 'none';
                 const allSelected = fields.every(f => selectedFields.has(f));
                 if (allSelected) return 'all';
