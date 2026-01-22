@@ -143,6 +143,25 @@
         // We use § (Section Sign) because it is rare in JSON keys.
         const PATH_SEP = '§';
 
+        /**
+         * Helper: Sanitize Column Names (Strict SQL Rules)
+         * Rules:
+         * 1. No special characters (only a-z, A-Z, 0-9, _)
+         * 2. Replace spaces and dots with underscores
+         * 3. No consecutive underscores (e.g. oid__id -> oid_id)
+         */
+        const sanitizeSqlIdentifier = (name) => {
+            if (!name) return "";
+            let clean = String(name);
+            // 1. Replace spaces and dots with underscores
+            clean = clean.replace(/[ .]/g, '_');
+            // 2. Remove all characters that are NOT alphanumeric or underscore
+            clean = clean.replace(/[^a-zA-Z0-9_]/g, '');
+            // 3. Collapse consecutive underscores
+            clean = clean.replace(/_+/g, '_');
+            return clean;
+        };
+
         // SQL Data Type Mappings
         // These are standard types used in AWS Redshift, Postgres, and Snowflake.
         const CATEGORIZED_TYPES = {
@@ -577,8 +596,10 @@
             schema.forEach(item => {
                 // Return explicitly set alias if exists (user override)
                 if (columnAliases[item.field]) {
-                    aliasMap[item.field] = columnAliases[item.field];
-                    usedAliases.add(columnAliases[item.field]);
+                    // Ensure even user overrides are sanitized just in case
+                    const safeAlias = sanitizeSqlIdentifier(columnAliases[item.field]);
+                    aliasMap[item.field] = safeAlias;
+                    usedAliases.add(safeAlias);
                     return;
                 }
                 const cleanPath = item.field.replace(/\[\]/g, '');
@@ -591,8 +612,13 @@
                 let candidate = "";
                 for (let i = startIdx; i >= 0; i--) {
                     const suffixParts = parts.slice(i);
-                    const cleanSuffixParts = suffixParts.map(p => p.replace(/^[\$_]+/, ''));
+                    // Sanitize each part before joining to ensure rules apply to source keys too
+                    const cleanSuffixParts = suffixParts.map(p => sanitizeSqlIdentifier(p));
                     candidate = cleanSuffixParts.join('_').toLowerCase();
+                    
+                    // Final sanitization to collapse any double underscores created by join
+                    candidate = sanitizeSqlIdentifier(candidate);
+
                     if (!candidate) candidate = "col";
                     if (!usedAliases.has(candidate)) {
                         foundUnique = true;
@@ -614,8 +640,10 @@
         };
 
         const getDefaultTableAlias = (path, index) => {
-            const name = path.split(PATH_SEP).pop();
-            return `t${index + 1}_${name ? name.replace(/[^a-zA-Z0-9]/g, '') : 'tbl'}`;
+            // Also sanitize table aliases for consistency
+            const rawName = path.split(PATH_SEP).pop();
+            const safeName = rawName ? sanitizeSqlIdentifier(rawName) : 'tbl';
+            return `t${index + 1}_${safeName}`;
         };
 
         /**
@@ -849,10 +877,11 @@
           const containerRef = useRef(null);
           const menuRef = useRef(null); 
           
-          const [coords, setCoords] = useState({ top: 0, left: 0, width: 0 });
+          const [coords, setCoords] = useState({ top: 0, left: 0, width: 0, placement: 'bottom' });
 
           useEffect(() => {
             const handleClickOutside = (event) => {
+              if (!(event.target instanceof Node)) return;
               if (
                   containerRef.current && !containerRef.current.contains(event.target) &&
                   (!menuRef.current || !menuRef.current.contains(event.target))
@@ -863,6 +892,9 @@
 
             const handleScroll = (event) => {
                 // Close if we scroll a parent, but NOT if we scroll the menu itself.
+                // Guard clause: ensure target is a valid Node before calling contains
+                if (!(event.target instanceof Node)) return;
+                
                 if (menuRef.current && (menuRef.current === event.target || menuRef.current.contains(event.target))) {
                     return;
                 }
@@ -886,18 +918,17 @@
             if (!isOpen && containerRef.current) {
                 const rect = containerRef.current.getBoundingClientRect();
                 const windowHeight = window.innerHeight;
-                let top = rect.bottom;
+                const spaceBelow = windowHeight - rect.bottom;
                 
-                // Basic flip logic if too close to bottom
-                if (windowHeight - rect.bottom < 300) {
-                     top = rect.top - 300; // rough height of menu
-                     if (top < 0) top = rect.bottom; // fallback
-                }
+                // Flip if less than 280px space below
+                const shouldFlip = spaceBelow < 280;
                 
                 setCoords({ 
-                    top: rect.bottom, // Use direct viewport relative coordinate since body doesn't scroll
+                    top: shouldFlip ? 'auto' : rect.bottom, 
+                    bottom: shouldFlip ? (windowHeight - rect.top) : 'auto',
                     left: rect.left, 
-                    width: rect.width 
+                    width: rect.width,
+                    placement: shouldFlip ? 'top' : 'bottom'
                 });
             }
             setIsOpen(!isOpen);
@@ -948,8 +979,15 @@
               {isOpen && createPortal(
                 <div 
                     ref={menuRef}
-                    style={{ position: 'fixed', top: `${coords.top}px`, left: `${coords.left}px`, width: `${coords.width}px`, zIndex: 9999 }}
-                    className="mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl max-h-64 overflow-y-auto"
+                    style={{ 
+                        position: 'fixed', 
+                        left: `${coords.left}px`, 
+                        width: `${coords.width}px`, 
+                        zIndex: 9999,
+                        top: coords.placement === 'bottom' ? `${coords.top}px` : 'auto',
+                        bottom: coords.placement === 'top' ? `${coords.bottom}px` : 'auto',
+                    }}
+                    className={`bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl max-h-64 overflow-y-auto ${coords.placement === 'top' ? 'mb-1' : 'mt-1'}`}
                 >
                   {Object.entries(CATEGORIZED_TYPES).map(([category, types]) => (
                     <div key={category}>
@@ -996,6 +1034,7 @@
 
             useEffect(() => {
                 const handleClickOutside = (event) => {
+                    if (!(event.target instanceof Node)) return;
                     if (containerRef.current && !containerRef.current.contains(event.target)) {
                         setShowSuggestions(false);
                     }
@@ -1470,9 +1509,15 @@
                                     const target = e.target;
                                     setTimeout(() => {
                                         target.setSelectionRange(target.value.length, target.value.length);
+                                        target.scrollLeft = target.scrollWidth; // Force view to scroll to end
                                     }, 0);
                                 }}
-                                onChange={(e) => onColumnAliasChange({...columnAliases, [item.field]: e.target.value})}
+                                onChange={(e) => {
+                                    // Sanitize input immediately
+                                    const rawVal = e.target.value;
+                                    const sanitizedVal = sanitizeSqlIdentifier(rawVal);
+                                    onColumnAliasChange({...columnAliases, [item.field]: sanitizedVal});
+                                }}
                                 className="w-full px-2 py-1 text-sm md:text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded focus:ring-2 focus:ring-blue-500 outline-none text-blue-700 dark:text-blue-300 font-mono placeholder:text-slate-400 disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed h-[26px]"
                             />
                          )}
@@ -1538,7 +1583,8 @@
                         setExpandedPaths(new Set(['root']));
                     }
                 }
-            }, [expandSignal, schema]);
+                // REMOVED 'schema' from dependency array to prevent auto-expansion on data type changes
+            }, [expandSignal]);
 
             // Memoized Flattening Logic: Converts tree to flat list for virtualization
             const flatRows = useMemo(() => {
@@ -2045,6 +2091,7 @@
             setLoading(true);
             setLoadingProgress({ status: 'Reading file...', percent: 10 });
             setExpandSignal(null);
+            setSchemaExpandSignal(null); // Reset schema expansion state
             setViewMode('tree');
             setPreviewMode('json'); 
             setTableAliases({}); 
@@ -2146,7 +2193,8 @@
           const reset = () => {
             setJson(null); setSchemaData(null); setTableAliases({}); setColumnAliases({});
             setFileInfo(null); setError(null); setIsArrayMode(false); setTotalPages(0); setCurrentPage(0);
-            setExpandSignal(null); setSearchTerm('');
+            setExpandSignal(null); setSchemaExpandSignal(null); // Reset schema expansion state
+            setSearchTerm('');
             setExcludedFields(new Set());
             setSelectedFields(new Set());
             setFlattenedData(null);
