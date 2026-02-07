@@ -155,6 +155,10 @@
         const WORKER_CODE = `
             const PATH_SEP = '§';
 
+            /**
+             * Function: getRedshiftType
+             * Purpose: Analyzes a JS value and guesses the most appropriate SQL type.
+             */
             const getRedshiftType = (value) => {
                 if (value === null) return 'VARCHAR(256)'; 
                 const type = typeof value;
@@ -182,20 +186,28 @@
                 return clean;
             };
 
+            /**
+             * Function: generateSchema
+             * Purpose: Crawls the JSON structure to build a flat map of all possible fields.
+             */
             const generateSchema = (data, useSampling = false) => {
                 const fieldMap = new Map();
                 let dataToProcess = data;
                 
+                // OPTIMIZATION: Sampling Logic
                 if (useSampling && Array.isArray(data) && data.length > 500) {
                     const subset = [];
+                    // Always take the first 20 records (high probability of schema definition)
                     subset.push(...data.slice(0, 20));
                     const step = Math.ceil(data.length / 200);
+                    // Take distributed samples from the rest
                     for(let i = 20; i < data.length; i += step) {
                         subset.push(data[i]);
                     }
                     dataToProcess = subset;
                 }
 
+                // Helper to record field existence and type
                 const registerField = (path, value) => {
                     const redshiftType = getRedshiftType(value);
                     let isJson = false;
@@ -232,6 +244,7 @@
                             registerField(currentPath, []); 
                             return;
                         }
+                        // Refactor to string concat to avoid backtick nesting
                         const nextPathBase = currentPath ? currentPath + PATH_SEP + "[]" : ''; 
                         currentValue.forEach(item => traverse(item, nextPathBase));
                         return;
@@ -251,6 +264,7 @@
                     registerField(currentPath, currentValue);
                 };
 
+                // Start traversal
                 if (Array.isArray(dataToProcess)) {
                     dataToProcess.forEach(item => traverse(item, ''));
                 } else {
@@ -281,7 +295,7 @@
                             partName = partName.slice(0, -2);
                             arrayCount++;
                         }
-                        // Replace nested template literals with string concatenation to avoid parser errors
+                        // Use string concatenation for worker code compatibility
                         let currentBase = partName ? (pathSoFar ? pathSoFar + PATH_SEP + partName : partName) : pathSoFar;
                         for (let i = 1; i <= arrayCount; i++) {
                             let p = currentBase;
@@ -451,10 +465,10 @@
                     }
                     if (!foundUnique) {
                         let counter = 2;
-                        while (usedAliases.has(\`\${candidate}_\${counter}\`)) {
+                        while (usedAliases.has(candidate + '_' + counter)) {
                             counter++;
                         }
-                        candidate = \`\${candidate}_\${counter}\`;
+                        candidate = candidate + '_' + counter;
                     }
                     usedAliases.add(candidate);
                     aliasMap[item.field] = candidate;
@@ -465,7 +479,7 @@
             const getDefaultTableAlias = (path, index) => {
                 const rawName = path.split(PATH_SEP).pop();
                 const safeName = rawName ? sanitizeSqlIdentifier(rawName) : 'tbl';
-                return \`t\${index + 1}_\${safeName}\`;
+                return "t" + (index + 1) + "_" + safeName;
             };
 
             const generateSqlScript = (schema, tableAliases = {}, columnAliases = {}, config = {}) => {
@@ -504,21 +518,21 @@
 
                     let selection;
                     if (deepestArrayPath === "") {
-                        selection = parts.length > 0 ? \`"\${parentAlias}"."\${jsonColumn}".\${parts.map(p=>\`"\${p}"\`).join('.')}\` : \`"\${parentAlias}"."\${jsonColumn}"\`;
+                        selection = parts.length > 0 ? '"' + parentAlias + '"."' + jsonColumn + '".' + parts.map(p => '"' + p + '"').join('.') : '"' + parentAlias + '"."' + jsonColumn + '"';
                     } else {
                         if (parts.length === 0) {
-                            selection = \`"\${parentAlias}"\`;
+                            selection = '"' + parentAlias + '"';
                         } else {
-                            selection = \`"\${parentAlias}".\${parts.map(p=>\`"\${p}"\`).join('.')}\`;
+                            selection = '"' + parentAlias + '".' + parts.map(p => '"' + p + '"').join('.');
                         }
                     }
 
                     const castType = item.type.toUpperCase();
                     const colAlias = smartColAliases[item.field];
-                    return \`    CAST(\${selection} AS \${castType}) AS "\${colAlias}"\`;
+                    return '    CAST(' + selection + ' AS ' + castType + ') AS "' + colAlias + '"';
                 });
                 
-                let fromClause = \`FROM\\n    \${sourceTable} AS "\${aliases[""] || "src"}"\`;
+                let fromClause = 'FROM\\n    ' + sourceTable + ' AS "' + (aliases[""] || "src") + '"';
                 
                 sortedArrays.forEach((arrayPath) => {
                     const alias = aliases[arrayPath];
@@ -553,7 +567,9 @@
                          if (cleanProp.endsWith(PATH_SEP)) cleanProp = cleanProp.slice(0, -1);
                          
                         if (cleanProp.startsWith(PATH_SEP)) cleanProp = cleanProp.substring(1);
-                        const parts = cleanProp ? cleanProp.split(PATH_SEP).filter(Boolean) : [];
+                        
+                        // Aggressively filter out '[]' from parts to prevent "column"."[]" generation
+                        const parts = cleanProp ? cleanProp.split(PATH_SEP).filter(p => p && p !== '[]') : [];
 
                         if (parts.length === 0) {
                              // If cleanProp is empty but original path ended in [], it means we are unnesting the parent object itself which is an array
@@ -567,8 +583,8 @@
                     fromClause += \`\\n    LEFT JOIN \${joinExpr} AS "\${alias}" ON TRUE\`;
                 });
                 
-                const mainScript = \`SET enable_case_sensitive_identifier to TRUE;\\nCREATE OR REPLACE VIEW \${viewName} AS\\nSELECT\\n\${selectLines.join(',\\n')}\\n\${fromClause};\`;
-                const grants = \`\\n\\n/*\\n-- Grant Access Examples:\\nGRANT SELECT ON \${viewName} TO "user_name";\\nGRANT SELECT ON \${viewName} TO GROUP "group_name";\\n*/\`;
+                const mainScript = 'SET enable_case_sensitive_identifier to TRUE;\\nCREATE OR REPLACE VIEW ' + viewName + ' AS\\nSELECT\\n' + selectLines.join(',\\n') + '\\n' + fromClause + ';';
+                const grants = '\\n\\n/*\\n-- Grant Access Examples:\\nGRANT SELECT ON ' + viewName + ' TO "user_name";\\nGRANT SELECT ON ' + viewName + ' TO GROUP "group_name";\\n*/';
                 return mainScript + grants;
             };
 
@@ -581,24 +597,24 @@
                 const columnDefs = schema.map(item => {
                     const colAlias = smartColAliases[item.field];
                     const type = item.type;
-                    return \`    "\${colAlias}" \${type}\`;
+                    return '    "' + colAlias + '" ' + type;
                 });
 
-                let ddl = \`CREATE TABLE \${tableName} (\\n\${columnDefs.join(',\\n')}\\n)\\nDISTSTYLE \${diststyle}\`;
+                let ddl = 'CREATE TABLE ' + tableName + ' (\\n' + columnDefs.join(',\\n') + '\\n)\\nDISTSTYLE ' + diststyle;
                 
                 if (diststyle === 'KEY' && distKey) {
-                    ddl += \`\\nDISTKEY ("\${distKey}")\`;
+                    ddl += '\\nDISTKEY ("' + distKey + '")';
                 }
                 
                 if (sortKeys && sortKeys.trim()) {
                     const keys = sortKeys.split(',').map(k => k.trim()).filter(k => k);
                     if (keys.length > 0) {
-                        const quotedKeys = keys.map(k => \`"\${k}"\`).join(', ');
-                        ddl += \`\\nSORTKEY (\${quotedKeys})\`;
+                        const quotedKeys = keys.map(k => '"' + k + '"').join(', ');
+                        ddl += '\\nSORTKEY (' + quotedKeys + ')';
                     }
                 }
                 ddl += ';';
-                const grants = \`\\n\\n/*\\n-- Grant Access Examples:\\nGRANT ALL ON \${tableName} TO "user_name";\\nGRANT ALL ON \${tableName} TO GROUP "group_name";\\n*/\`;
+                const grants = '\\n\\n/*\\n-- Grant Access Examples:\\nGRANT ALL ON ' + tableName + ' TO "user_name";\\nGRANT ALL ON ' + tableName + ' TO GROUP "group_name";\\n*/';
                 return ddl + grants;
             };
 
@@ -2390,6 +2406,15 @@
                   setError("Please paste some JSON content first.");
                   return;
               }
+              
+              // Validate JSON before processing
+              try {
+                  JSON.parse(pastedContent);
+              } catch (e) {
+                  setError("Invalid JSON format: " + e.message);
+                  return;
+              }
+
               const sizeKB = (new Blob([pastedContent]).size / 1024).toFixed(2);
               processJsonData(pastedContent, {
                   name: 'Raw Input',
@@ -2511,6 +2536,15 @@
                             </div>
                         </div>
                     </div>
+                )}
+
+                {/* Error Display - Moved Here for Visibility */}
+                {error && (
+                  <div className="flex-none mb-4 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg flex items-start gap-3 animate-in fade-in slide-in-from-top-4 relative z-40">
+                    <AlertCircle className="text-red-500 shrink-0 mt-0.5" size={20} />
+                    <div className="flex-1"><h3 className="text-red-800 dark:text-red-200 font-medium">Validation Failed</h3><p className="text-red-600 dark:text-red-300 text-sm mt-1">{error}</p></div>
+                    <button onClick={() => setError(null)} className="text-red-400 hover:text-red-600"><X size={18} /></button>
+                  </div>
                 )}
 
                 {/* File Upload / Paste Zone */}
