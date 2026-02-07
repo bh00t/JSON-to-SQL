@@ -3,33 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>JSON to SQL</title>
-    
-    <!-- 
-      ================================================================================
-      PROJECT ARCHITECTURE & TECH STACK
-      ================================================================================
-      
-      Architecture: Single File Component (SFC) / SPA
-      - The entire application lives in this one HTML file. 
-      - This ensures zero-setup portability (just double-click to run).
-      - All logic, including the Web Worker, React Components, and Styles are embedded here.
-
-      Tech Stack:
-      1. React (via ESM): UI Component library for managing complex state (schema, preview).
-      2. Babel (Standalone): Compiles JSX/ES6+ code in the browser at runtime.
-      3. Tailwind CSS (CDN): Utility-first CSS framework for rapid, responsive UI design.
-      4. Lucide React (ESM): Icon library.
-      5. Web Workers: Used to offload heavy JSON parsing and array flattening logic 
-         to a background thread, keeping the UI responsive.
-
-      Core Features:
-      - JSON Schema Inference with Type Detection (Redshift flavor).
-      - Virtualized Tables for handling massive datasets (up to 5000 rows previewed efficiently).
-      - Recursive Tree Views for visualizing JSON structure.
-      - Auto-generation of SQL (DDL and VIEWs) with smart alias collision handling.
-      ================================================================================
-    -->
+    <title>JSON to SQL Converter</title>
+    <meta name="description" content="Convert nested JSON to SQL (Redshift/Postgres) schemas instantly in your browser.">
     
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -75,13 +50,11 @@
             }
         }
     </script>
-    <!-- FIX: Pinned Babel version to 7.23.6 to resolve .targets["esmodules"] validation error -->
+    <!-- Babel for JSX compilation -->
     <script src="https://unpkg.com/@babel/standalone@7.23.6/babel.min.js"></script>
 
     <style>
-        /* Custom Scrollbar Styles 
-           Provides a consistent, sleek look across browsers, matching the Tailwind theme.
-        */
+        /* Custom Scrollbar Styles */
         ::-webkit-scrollbar {
             width: 10px;
             height: 10px;
@@ -107,13 +80,10 @@
         
         body {
             font-family: 'Inter', sans-serif;
-            overflow: hidden; /* Prevent body scroll, let React containers handle scrolling via Virtualization */
+            overflow: hidden; 
         }
         
-        /* Performance Optimization for Large Lists 
-           'contain: strict' tells the browser that content inside this container 
-           won't affect layout outside, speeding up scrolling calculations.
-        */
+        /* Performance Optimization for Large Lists */
         .virtual-list-container {
             will-change: transform;
             contain: strict; 
@@ -131,11 +101,11 @@
           Upload, FileJson, AlertCircle, X, ChevronRight, ChevronDown, 
           CheckCircle, Trash2, ChevronLeft, Maximize2, Minimize2, 
           MoreHorizontal, Database, Table, Code, Check, FileText, Copy, Eye, Settings, RefreshCw, Edit3, Search, Moon, Sun, Lightbulb, RotateCcw, Download, Loader2, Zap, Layers, ArrowUpNarrowWide,
-          PanelLeftClose, PanelLeftOpen, Undo2, Folder, FolderOpen, List, Grid, ToggleLeft, ToggleRight, Minus
+          PanelLeftClose, PanelLeftOpen, Undo2, Folder, FolderOpen, List, Grid, ToggleLeft, ToggleRight, Minus, Filter
         } from 'lucide-react';
 
         // --- CONSTANTS ---
-        const MAX_FILE_SIZE_MB = 20; 
+        const MAX_FILE_SIZE_MB = 50; 
         const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
         const MAX_ITEMS_PREVIEW = 20; 
         const MAX_STRING_LENGTH = 100;
@@ -146,25 +116,28 @@
 
         /**
          * Helper: Sanitize Column Names (Strict SQL Rules)
-         * Rules:
-         * 1. No special characters (only a-z, A-Z, 0-9, _)
-         * 2. Replace spaces and dots with underscores
-         * 3. No consecutive underscores (e.g. oid__id -> oid_id)
          */
         const sanitizeSqlIdentifier = (name) => {
             if (!name) return "";
             let clean = String(name);
-            // 1. Replace spaces and dots with underscores
             clean = clean.replace(/[ .]/g, '_');
-            // 2. Remove all characters that are NOT alphanumeric or underscore
             clean = clean.replace(/[^a-zA-Z0-9_]/g, '');
-            // 3. Collapse consecutive underscores
             clean = clean.replace(/_+/g, '_');
+            clean = clean.replace(/^_+|_+$/g, '');
             return clean;
         };
 
+        // --- Helper: useDebounce ---
+        function useDebounce(value, delay) {
+          const [debouncedValue, setDebouncedValue] = useState(value);
+          useEffect(() => {
+            const handler = setTimeout(() => setDebouncedValue(value), delay);
+            return () => clearTimeout(handler);
+          }, [value, delay]);
+          return debouncedValue;
+        }
+
         // SQL Data Type Mappings
-        // These are standard types used in AWS Redshift, Postgres, and Snowflake.
         const CATEGORIZED_TYPES = {
             "Numeric": ['SMALLINT', 'INTEGER', 'BIGINT', 'DECIMAL', 'REAL', 'DOUBLE PRECISION'],
             "Character": ['CHAR', 'VARCHAR', 'VARCHAR(256)', 'VARCHAR(65535)', 'TEXT'],
@@ -178,31 +151,16 @@
          * =================================================================================
          * WEB WORKER LOGIC
          * =================================================================================
-         * Why a Worker? 
-         * Parsing 20MB of JSON, inferring schemas from 100k rows, and flattening nested structures
-         * is computationally expensive (O(N) or O(N*M)). Doing this on the main thread would freeze 
-         * the UI/React rendering.
-         * * This string is converted to a Blob and executed in a separate thread.
          */
         const WORKER_CODE = `
             const PATH_SEP = '§';
 
-            /**
-             * Function: getRedshiftType
-             * Purpose: Analyzes a JS value and guesses the most appropriate SQL type.
-             * Logic:
-             * - Checks for primitive types (bool, number).
-             * - Heuristic checks for Date strings (ISO format, slashes).
-             * - Length checks for VARCHAR sizing.
-             * - Arrays/Objects default to 'SUPER' (JSON).
-             */
             const getRedshiftType = (value) => {
                 if (value === null) return 'VARCHAR(256)'; 
                 const type = typeof value;
                 if (type === 'boolean') return 'BOOLEAN';
                 if (type === 'number') return Number.isInteger(value) ? 'BIGINT' : 'DOUBLE PRECISION';
                 if (type === 'string') {
-                    // Basic date detection regex/logic
                     if (value.length >= 10 && value.length <= 30 && !isNaN(Date.parse(value)) && (value.includes('-') || value.includes('/'))) {
                     return value.includes(':') ? 'TIMESTAMP' : 'DATE';
                     }
@@ -214,48 +172,56 @@
                 return 'VARCHAR(256)';
             };
 
-            /**
-             * Function: generateSchema
-             * Purpose: Crawls the JSON structure to build a flat map of all possible fields.
-             * Optimization:
-             * - "Sampling": If useSampling is true, it skips rows. Instead of checking 100k rows,
-             * it checks the first 20 (to capture headers) and then samples every Nth row.
-             * This drastically reduces processing time for large files.
-             */
+            const sanitizeSqlIdentifier = (name) => {
+                if (!name) return "";
+                let clean = String(name);
+                clean = clean.replace(/[ .]/g, '_');
+                clean = clean.replace(/[^a-zA-Z0-9_]/g, '');
+                clean = clean.replace(/_+/g, '_');
+                clean = clean.replace(/^_+|_+$/g, '');
+                return clean;
+            };
+
             const generateSchema = (data, useSampling = false) => {
                 const fieldMap = new Map();
                 let dataToProcess = data;
                 
-                // OPTIMIZATION: Sampling Logic
                 if (useSampling && Array.isArray(data) && data.length > 500) {
                     const subset = [];
-                    // Always take the first 20 records (high probability of schema definition)
                     subset.push(...data.slice(0, 20));
                     const step = Math.ceil(data.length / 200);
-                    // Take distributed samples from the rest
                     for(let i = 20; i < data.length; i += step) {
                         subset.push(data[i]);
                     }
                     dataToProcess = subset;
                 }
 
-                // Helper to record field existence and type
                 const registerField = (path, value) => {
                     const redshiftType = getRedshiftType(value);
+                    let isJson = false;
+                    
+                    if (typeof value === 'string') {
+                        const trimmed = value.trim();
+                        if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                            try {
+                                JSON.parse(trimmed);
+                                isJson = true;
+                            } catch (e) { }
+                        }
+                    }
+
                     if (!fieldMap.has(path)) {
-                        fieldMap.set(path, { type: redshiftType, sample: value });
+                        fieldMap.set(path, { type: redshiftType, sample: value, isJson });
                     } else {
-                        // Type refinement: If we previously saw NULL, update with actual value if found.
                         const current = fieldMap.get(path);
                         if (current.sample === null && value !== null) {
-                            fieldMap.set(path, { type: redshiftType, sample: value });
+                            current.type = redshiftType;
+                            current.sample = value;
                         }
+                        if (isJson) current.isJson = true;
                     }
                 };
 
-                // Recursive Traversal: Walks down Objects and Arrays
-                // path format: "users.address.city" or "orders[].items[].price"
-                // uses PATH_SEP instead of dot to handle keys containing dots
                 const traverse = (currentValue, currentPath) => {
                     if (currentValue === null) {
                         registerField(currentPath, null);
@@ -266,7 +232,7 @@
                             registerField(currentPath, []); 
                             return;
                         }
-                        const nextPathBase = currentPath ? \`\${currentPath}\${PATH_SEP}[]\` : ''; 
+                        const nextPathBase = currentPath ? currentPath + PATH_SEP + "[]" : ''; 
                         currentValue.forEach(item => traverse(item, nextPathBase));
                         return;
                     }
@@ -277,7 +243,7 @@
                             return;
                         }
                         keys.forEach(key => {
-                            const nextPath = currentPath ? \`\${currentPath}\${PATH_SEP}\${key}\` : key;
+                            const nextPath = currentPath ? currentPath + PATH_SEP + key : key;
                             traverse(currentValue[key], nextPath);
                         });
                         return;
@@ -285,30 +251,23 @@
                     registerField(currentPath, currentValue);
                 };
 
-                // Start traversal
                 if (Array.isArray(dataToProcess)) {
                     dataToProcess.forEach(item => traverse(item, ''));
                 } else {
                     traverse(dataToProcess, '');
                 }
 
-                // Convert Map to Array for React
                 return Array.from(fieldMap.entries())
                     .filter(([field]) => field !== '') 
                     .map(([field, info]) => ({
-                    field,
-                    type: info.type,
-                    originalType: info.type, 
-                    sample: info.sample
+                        field,
+                        type: info.type,
+                        originalType: info.type, 
+                        sample: info.sample,
+                        isJson: info.isJson
                     }));
             };
 
-            /**
-             * Function: getArrayPaths
-             * Purpose: Identifies all nested array levels (e.g., "orders[]", "orders[].items[]").
-             * Why: In SQL, every array level represents a 1:N relationship requiring a LEFT JOIN (unnest).
-             * We sort by length so we process parents before children.
-             */
             const getArrayPaths = (schema) => {
                 if (!schema) return [];
                 const arrayPaths = new Set();
@@ -322,20 +281,21 @@
                             partName = partName.slice(0, -2);
                             arrayCount++;
                         }
-                        let currentBase = pathSoFar ? \`\${pathSoFar}\${PATH_SEP}\${partName}\` : partName;
-                        // Iterate from 1 to arrayCount to ensure nested arrays [[...]] are captured
+                        // Replace nested template literals with string concatenation to avoid parser errors
+                        let currentBase = partName ? (pathSoFar ? pathSoFar + PATH_SEP + partName : partName) : pathSoFar;
                         for (let i = 1; i <= arrayCount; i++) {
                             let p = currentBase;
-                            for (let k = 0; k < i; k++) p += "[]";
+                            for (let k = 0; k < i; k++) {
+                                p = p ? p + PATH_SEP + "[]" : "[]";
+                            }
                             arrayPaths.add(p);
                         }
-                        pathSoFar = pathSoFar ? \`\${pathSoFar}\${PATH_SEP}\${part}\` : part;
+                        pathSoFar = pathSoFar ? pathSoFar + PATH_SEP + part : part;
                     });
                 });
                 return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
             };
 
-            // Safe property access utility with custom separator
             const getValue = (obj, path) => {
                 if (!path) return obj;
                 const parts = path.split(PATH_SEP).filter(p => p !== "");
@@ -347,18 +307,6 @@
                 return current;
             };
 
-            /**
-             * Function: generateFlattenedData
-             * THE CORE ENGINE: Converts nested JSON into flat rows (Denormalization).
-             * * Logic Overview:
-             * 1. Start with the root record as context.
-             * 2. Iterate through every array path found in the schema (e.g., "orders[]").
-             * 3. "Explode" the context: For each existing context row, find the array data.
-             * - If array has 3 items, the single context row becomes 3 rows.
-             * - If array is empty/null, keep 1 row with nulls (LEFT JOIN behavior).
-             * 4. Repeat for nested arrays (orders[].items[]) using the expanded contexts.
-             * 5. Finally, map simple fields (e.g., "orders[].id") from the specific context they belong to.
-             */
             const generateFlattenedData = (json, schema, aliases, limit) => {
                 const sortedArrays = getArrayPaths(schema);
                 const resultRows = [];
@@ -368,14 +316,10 @@
                 for (const record of dataToProcess) {
                     if (resultRows.length >= maxOutputRows) break;
                     
-                    // Step 1: Initial Context
                     let contexts = [{ "": record }];
 
-                    // Step 2 & 3: Iteratively expand contexts based on array depth
                     for (const arrayPath of sortedArrays) {
                         const nextContexts = [];
-                        
-                        // Find parent array to read data from
                         let parentArrayPath = "";
                         for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
                             if (arrayPath.startsWith(sortedArrays[i])) {
@@ -389,17 +333,14 @@
                         if (relativePath.startsWith(PATH_SEP)) relativePath = relativePath.substring(1);
                         if (relativePath.endsWith('[]')) relativePath = relativePath.slice(0, -2);
 
-                        // Expand
                         for (const ctx of contexts) {
                             const parentData = ctx[parentArrayPath || ""];
                             let arrayData = null;
                             if (parentData) arrayData = getValue(parentData, relativePath);
 
                             if (Array.isArray(arrayData) && arrayData.length > 0) {
-                                // Explosion: 1 parent row -> N child rows
                                 for (const item of arrayData) nextContexts.push({ ...ctx, [arrayPath]: item });
                             } else {
-                                // Preservation: 1 parent row -> 1 child row (values null)
                                 nextContexts.push({ ...ctx, [arrayPath]: null });
                             }
                         }
@@ -407,14 +348,12 @@
                         if (contexts.length > maxOutputRows) break; 
                     }
 
-                    // Step 4: Map Final Values
                     for (const ctx of contexts) {
                         if (resultRows.length >= maxOutputRows) break;
                         const row = {};
                         schema.forEach(fieldItem => {
                             const fullPath = fieldItem.field;
                             
-                            // Determine which context owns this field (deepest match)
                             let deepestArrayPath = "";
                             for (const arrayPath of sortedArrays) {
                                 if (fullPath === arrayPath || fullPath.startsWith(arrayPath + PATH_SEP) || fullPath.startsWith(arrayPath + '[')) {
@@ -438,7 +377,6 @@
                 return resultRows;
             };
 
-             // Helper: Counts rows without overhead of creating objects (for "Total Records" stat)
              const calculateContextCount = (contexts, arrayPath, sortedArrays) => {
                   const nextContexts = [];
                   let parentArrayPath = "";
@@ -480,11 +418,193 @@
                 return totalCount;
             };
 
-            // Main Message Bus
+            const generateUniqueAliases = (schema, columnAliases) => {
+                const usedAliases = new Set();
+                const aliasMap = {}; 
+                if (!schema) return {};
+
+                schema.forEach(item => {
+                    if (columnAliases[item.field]) {
+                        const safeAlias = sanitizeSqlIdentifier(columnAliases[item.field]);
+                        aliasMap[item.field] = safeAlias;
+                        usedAliases.add(safeAlias);
+                        return;
+                    }
+                    const cleanPath = item.field.replace(/\[\]/g, '');
+                    const parts = cleanPath.split(PATH_SEP).filter(Boolean);
+                    
+                    let startIdx = Math.max(1, parts.length - 2); 
+                    if (parts.length === 1) startIdx = 0;
+                    let foundUnique = false;
+                    let candidate = "";
+                    for (let i = startIdx; i >= 0; i--) {
+                        const suffixParts = parts.slice(i);
+                        const cleanSuffixParts = suffixParts.map(p => sanitizeSqlIdentifier(p));
+                        candidate = cleanSuffixParts.join('_').toLowerCase();
+                        candidate = sanitizeSqlIdentifier(candidate);
+
+                        if (!candidate) candidate = "col";
+                        if (!usedAliases.has(candidate)) {
+                            foundUnique = true;
+                            break;
+                        }
+                    }
+                    if (!foundUnique) {
+                        let counter = 2;
+                        while (usedAliases.has(\`\${candidate}_\${counter}\`)) {
+                            counter++;
+                        }
+                        candidate = \`\${candidate}_\${counter}\`;
+                    }
+                    usedAliases.add(candidate);
+                    aliasMap[item.field] = candidate;
+                });
+                return aliasMap;
+            };
+
+            const getDefaultTableAlias = (path, index) => {
+                const rawName = path.split(PATH_SEP).pop();
+                const safeName = rawName ? sanitizeSqlIdentifier(rawName) : 'tbl';
+                return \`t\${index + 1}_\${safeName}\`;
+            };
+
+            const generateSqlScript = (schema, tableAliases = {}, columnAliases = {}, config = {}) => {
+                if (!schema || schema.length === 0) return "-- No schema detected.";
+                
+                const { 
+                    sourceTable = "raw_data.source_table", 
+                    viewName = "schema.vw_data", 
+                    jsonColumn = "data" 
+                } = config;
+
+                const sortedArrays = getArrayPaths(schema);
+                const aliases = { "": "src", ...tableAliases }; 
+                sortedArrays.forEach((path, index) => {
+                    if (!aliases[path]) aliases[path] = getDefaultTableAlias(path, index);
+                });
+                const smartColAliases = generateUniqueAliases(schema, columnAliases);
+                
+                const selectLines = schema.map(item => {
+                    let deepestArrayPath = "";
+                    for (const arrayPath of sortedArrays) {
+                        if (item.field === arrayPath || item.field.startsWith(arrayPath + PATH_SEP) || item.field.startsWith(arrayPath + '[')) {
+                            if (arrayPath.length > deepestArrayPath.length) deepestArrayPath = arrayPath;
+                        }
+                    }
+
+                    let parentAlias = aliases[deepestArrayPath] || "src";
+                    let relativePath = item.field;
+                    if (deepestArrayPath) {
+                        relativePath = item.field.substring(deepestArrayPath.length);
+                    }
+                    
+                    let cleanRelative = relativePath.replace(/\[\]/g, '');
+                    if (cleanRelative.startsWith(PATH_SEP)) cleanRelative = cleanRelative.substring(1);
+                    const parts = cleanRelative ? cleanRelative.split(PATH_SEP).filter(Boolean) : [];
+
+                    let selection;
+                    if (deepestArrayPath === "") {
+                        selection = parts.length > 0 ? \`"\${parentAlias}"."\${jsonColumn}".\${parts.map(p=>\`"\${p}"\`).join('.')}\` : \`"\${parentAlias}"."\${jsonColumn}"\`;
+                    } else {
+                        if (parts.length === 0) {
+                            selection = \`"\${parentAlias}"\`;
+                        } else {
+                            selection = \`"\${parentAlias}".\${parts.map(p=>\`"\${p}"\`).join('.')}\`;
+                        }
+                    }
+
+                    const castType = item.type.toUpperCase();
+                    const colAlias = smartColAliases[item.field];
+                    return \`    CAST(\${selection} AS \${castType}) AS "\${colAlias}"\`;
+                });
+                
+                let fromClause = \`FROM\\n    \${sourceTable} AS "\${aliases[""] || "src"}"\`;
+                
+                sortedArrays.forEach((arrayPath) => {
+                    const alias = aliases[arrayPath];
+                    let parentArrayPath = "";
+                    
+                    for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
+                        const potentialParent = sortedArrays[i];
+                        if (arrayPath.startsWith(potentialParent)) {
+                            parentArrayPath = potentialParent;
+                            break;
+                        }
+                    }
+                    
+                    const parentAlias = parentArrayPath ? aliases[parentArrayPath] : (aliases[""] || "src");
+                    let relativePath = arrayPath;
+                    if (parentArrayPath) {
+                        relativePath = arrayPath.substring(parentArrayPath.length);
+                    }
+                    if (relativePath.startsWith(PATH_SEP)) relativePath = relativePath.substring(1);
+                    
+                    let joinExpr;
+                    if (relativePath === "[]") {
+                        joinExpr = \`"\${parentAlias}"\`;
+                    } else {
+                        // FIX: Remove suffix '[]' from relative path logic to join cleanly
+                        let cleanProp = relativePath;
+                        if (cleanProp.endsWith('[]')) {
+                            cleanProp = cleanProp.slice(0, -2);
+                        }
+                        
+                        // Also remove trailing path separator if any
+                         if (cleanProp.endsWith(PATH_SEP)) cleanProp = cleanProp.slice(0, -1);
+                         
+                        if (cleanProp.startsWith(PATH_SEP)) cleanProp = cleanProp.substring(1);
+                        const parts = cleanProp ? cleanProp.split(PATH_SEP).filter(Boolean) : [];
+
+                        if (parts.length === 0) {
+                             // If cleanProp is empty but original path ended in [], it means we are unnesting the parent object itself which is an array
+                              joinExpr = \`"\${parentAlias}"\`;
+                        } else if (parentArrayPath === "") {
+                            joinExpr = \`"\${parentAlias}"."\${jsonColumn}".\${parts.map(p=>\`"\${p}"\`).join('.')}\`;
+                        } else {
+                            joinExpr = \`"\${parentAlias}".\${parts.map(p=>\`"\${p}"\`).join('.')}\`;
+                        }
+                    }
+                    fromClause += \`\\n    LEFT JOIN \${joinExpr} AS "\${alias}" ON TRUE\`;
+                });
+                
+                const mainScript = \`SET enable_case_sensitive_identifier to TRUE;\\nCREATE OR REPLACE VIEW \${viewName} AS\\nSELECT\\n\${selectLines.join(',\\n')}\\n\${fromClause};\`;
+                const grants = \`\\n\\n/*\\n-- Grant Access Examples:\\nGRANT SELECT ON \${viewName} TO "user_name";\\nGRANT SELECT ON \${viewName} TO GROUP "group_name";\\n*/\`;
+                return mainScript + grants;
+            };
+
+            const generateTableDDL = (schema, columnAliases = {}, config = {}) => {
+                if (!schema || schema.length === 0) return "-- No schema detected.";
+                
+                const { tableName = "<schema.table_name>", diststyle = "AUTO", distKey = "", sortKeys = "" } = config; 
+                const smartColAliases = generateUniqueAliases(schema, columnAliases);
+                
+                const columnDefs = schema.map(item => {
+                    const colAlias = smartColAliases[item.field];
+                    const type = item.type;
+                    return \`    "\${colAlias}" \${type}\`;
+                });
+
+                let ddl = \`CREATE TABLE \${tableName} (\\n\${columnDefs.join(',\\n')}\\n)\\nDISTSTYLE \${diststyle}\`;
+                
+                if (diststyle === 'KEY' && distKey) {
+                    ddl += \`\\nDISTKEY ("\${distKey}")\`;
+                }
+                
+                if (sortKeys && sortKeys.trim()) {
+                    const keys = sortKeys.split(',').map(k => k.trim()).filter(k => k);
+                    if (keys.length > 0) {
+                        const quotedKeys = keys.map(k => \`"\${k}"\`).join(', ');
+                        ddl += \`\\nSORTKEY (\${quotedKeys})\`;
+                    }
+                }
+                ddl += ';';
+                const grants = \`\\n\\n/*\\n-- Grant Access Examples:\\nGRANT ALL ON \${tableName} TO "user_name";\\nGRANT ALL ON \${tableName} TO GROUP "group_name";\\n*/\`;
+                return ddl + grants;
+            };
+
             self.onmessage = function(e) {
                 const { type, payload } = e.data;
                 if (type === 'PROCESS_FILE') {
-                    // Logic: Parse -> Infer Schema -> Return
                     try {
                         const { text, useSampling } = payload;
                         self.postMessage({ type: 'PROGRESS', payload: { status: 'Parsing JSON...', percent: 30 } });
@@ -497,7 +617,6 @@
                         self.postMessage({ type: 'ERROR', payload: err.message });
                     }
                 } else if (type === 'FLATTEN_DATA') {
-                    // Logic: Run Flattening Engine
                     try {
                         const { json, schema, aliases, limit } = payload;
                         const flatData = generateFlattenedData(json, schema, aliases, limit);
@@ -506,19 +625,30 @@
                         self.postMessage({ type: 'ERROR', payload: "Flattening failed: " + err.message });
                     }
                 } else if (type === 'CALC_TOTAL_ROWS') {
-                     // Logic: Run Counting Engine
                      try {
                           const { json, schema } = payload;
                           const count = countTotalRows(json, schema);
                           self.postMessage({ type: 'TOTAL_ROWS_SUCCESS', payload: count });
                       } catch (err) { console.error(err); }
+                } else if (type === 'GENERATE_SQL') {
+                    try {
+                        const { schema, mode, columnAliases, config } = payload;
+                        let result = '';
+                        if (mode === 'view') {
+                            result = generateSqlScript(schema, {}, columnAliases, config);
+                        } else {
+                            result = generateTableDDL(schema, columnAliases, config);
+                        }
+                        self.postMessage({ type: 'SQL_SUCCESS', payload: result });
+                    } catch (err) {
+                        self.postMessage({ type: 'ERROR', payload: err.message });
+                    }
                 }
             };
         `;
 
         // --- Custom Reusable Components ---
 
-        // Simple Tooltip component using group-hover CSS
         const Tooltip = ({ content, children, position = 'top', disabled = false }) => {
           if (disabled || !content) return <>{children}</>;
           const positions = {
@@ -537,26 +667,11 @@
           );
         };
 
-        // --- Helper: useDebounce ---
-        // Delays state updates (like search terms) to prevent lags on every keystroke
-        function useDebounce(value, delay) {
-          const [debouncedValue, setDebouncedValue] = useState(value);
-          useEffect(() => {
-            const handler = setTimeout(() => setDebouncedValue(value), delay);
-            return () => clearTimeout(handler);
-          }, [value, delay]);
-          return debouncedValue;
-        }
-
-        // --- Worker Creation Helper ---
         const createWorker = () => {
             const blob = new Blob([WORKER_CODE], { type: "application/javascript" });
             return new Worker(URL.createObjectURL(blob));
         };
 
-        // --- SQL Generation Logic (View & Table DDL) ---
-        
-        // Re-implementing array path logic here for main thread synchronous use
         const getArrayPaths = (schema) => {
             if (!schema) return [];
             const arrayPaths = new Set();
@@ -570,10 +685,12 @@
                         partName = partName.slice(0, -2);
                         arrayCount++;
                     }
-                    let currentBase = pathSoFar ? `${pathSoFar}${PATH_SEP}${partName}` : partName;
-                    for (let i = 0; i < arrayCount; i++) {
+                    let currentBase = partName ? (pathSoFar ? `${pathSoFar}${PATH_SEP}${partName}` : partName) : pathSoFar;
+                    for (let i = 1; i <= arrayCount; i++) {
                         let p = currentBase;
-                        for (let k = 0; k < i; k++) p += "[]";
+                        for (let k = 0; k < i; k++) {
+                            p = p ? `${p}${PATH_SEP}[]` : `[]`;
+                        }
                         arrayPaths.add(p);
                     }
                     pathSoFar = pathSoFar ? `${pathSoFar}${PATH_SEP}${part}` : part;
@@ -582,42 +699,29 @@
             return Array.from(arrayPaths).filter(p => p !== "").sort((a, b) => a.length - b.length);
         };
 
-        /**
-         * Function: generateUniqueAliases
-         * Purpose: Ensures that every column in the output SQL has a unique, safe name.
-         * Logic: 
-         * - If `user.id` and `order.id` both exist, simply using "id" is ambiguous.
-         * - It tries "id", then "user_id", then "user_id_2" until a unique name is found.
-         */
         const generateUniqueAliases = (schema, columnAliases) => {
             const usedAliases = new Set();
             const aliasMap = {}; 
             if (!schema) return {};
 
             schema.forEach(item => {
-                // Return explicitly set alias if exists (user override)
                 if (columnAliases[item.field]) {
-                    // Ensure even user overrides are sanitized just in case
                     const safeAlias = sanitizeSqlIdentifier(columnAliases[item.field]);
                     aliasMap[item.field] = safeAlias;
                     usedAliases.add(safeAlias);
                     return;
                 }
                 const cleanPath = item.field.replace(/\[\]/g, '');
-                const parts = cleanPath.split(PATH_SEP);
-                // Heuristic: start with just the last part (e.g. "city")
-                // If conflict, prepend previous part (e.g. "address_city")
+                const parts = cleanPath.split(PATH_SEP).filter(Boolean);
+                
                 let startIdx = Math.max(1, parts.length - 2); 
                 if (parts.length === 1) startIdx = 0;
                 let foundUnique = false;
                 let candidate = "";
                 for (let i = startIdx; i >= 0; i--) {
                     const suffixParts = parts.slice(i);
-                    // Sanitize each part before joining to ensure rules apply to source keys too
                     const cleanSuffixParts = suffixParts.map(p => sanitizeSqlIdentifier(p));
                     candidate = cleanSuffixParts.join('_').toLowerCase();
-                    
-                    // Final sanitization to collapse any double underscores created by join
                     candidate = sanitizeSqlIdentifier(candidate);
 
                     if (!candidate) candidate = "col";
@@ -626,7 +730,6 @@
                         break;
                     }
                 }
-                // Fallback: append numbers
                 if (!foundUnique) {
                     let counter = 2;
                     while (usedAliases.has(`${candidate}_${counter}`)) {
@@ -641,153 +744,10 @@
         };
 
         const getDefaultTableAlias = (path, index) => {
-            // Also sanitize table aliases for consistency
             const rawName = path.split(PATH_SEP).pop();
             const safeName = rawName ? sanitizeSqlIdentifier(rawName) : 'tbl';
             return `t${index + 1}_${safeName}`;
         };
-
-        /**
-         * Function: generateSqlScript
-         * Purpose: Generates the CREATE VIEW script.
-         * Key Logic:
-         * - Uses standard SQL JSON extraction (dot notation).
-         * - Generates LEFT JOIN ... ON TRUE for array unnesting.
-         * - Applies CAST for data types inferred by the worker.
-         */
-        const generateSqlScript = (schema, tableAliases = {}, columnAliases = {}, config = {}) => {
-            if (!schema || schema.length === 0) return "-- No schema detected.";
-            
-            const { 
-                sourceTable = "raw_data.source_table", 
-                viewName = "schema.vw_data", 
-                jsonColumn = "data" 
-            } = config;
-
-            const sortedArrays = getArrayPaths(schema);
-            const aliases = { "": "src", ...tableAliases }; 
-            sortedArrays.forEach((path, index) => {
-                if (!aliases[path]) aliases[path] = getDefaultTableAlias(path, index);
-            });
-            const smartColAliases = generateUniqueAliases(schema, columnAliases);
-            
-            // Build SELECT clause
-            const selectLines = schema.map(item => {
-                let deepestArrayPath = "";
-                for (const arrayPath of sortedArrays) {
-                    if (item.field === arrayPath || item.field.startsWith(arrayPath + PATH_SEP) || item.field.startsWith(arrayPath + '[')) {
-                         if (arrayPath.length > deepestArrayPath.length) deepestArrayPath = arrayPath;
-                    }
-                }
-
-                let parentAlias = aliases[deepestArrayPath] || "src";
-                let relativePath = item.field;
-                if (deepestArrayPath) {
-                    relativePath = item.field.substring(deepestArrayPath.length);
-                }
-                
-                let cleanRelative = relativePath.replace(/\[\]/g, '');
-                if (cleanRelative.startsWith(PATH_SEP)) cleanRelative = cleanRelative.substring(1);
-                
-                let selection;
-                
-                // Dot notation logic for JSON extraction
-                // Note: We use the PARTS split by PATH_SEP but join them with SQL dots
-                const parts = cleanRelative ? cleanRelative.split(PATH_SEP) : [];
-
-                if (deepestArrayPath === "") {
-                     selection = parts.length > 0 ? `"${parentAlias}"."${jsonColumn}".${parts.map(p=>`"${p}"`).join('.')}` : `"${parentAlias}"."${jsonColumn}"`;
-                } else {
-                     if (parts.length === 0) {
-                         selection = `"${parentAlias}"`;
-                     } else {
-                         selection = `"${parentAlias}".${parts.map(p=>`"${p}"`).join('.')}`;
-                     }
-                }
-
-                const castType = item.type.toUpperCase();
-                const colAlias = smartColAliases[item.field];
-                return `    CAST(${selection} AS ${castType}) AS "${colAlias}"`;
-            });
-            
-            let fromClause = `FROM\n    ${sourceTable} AS "${aliases[""] || "src"}"`;
-            
-            // Build JOIN clauses for arrays (Iterative Unnesting)
-            sortedArrays.forEach((arrayPath) => {
-                const alias = aliases[arrayPath];
-                let parentArrayPath = "";
-                
-                for (let i = sortedArrays.indexOf(arrayPath) - 1; i >= 0; i--) {
-                    const potentialParent = sortedArrays[i];
-                    if (arrayPath.startsWith(potentialParent)) {
-                        parentArrayPath = potentialParent;
-                        break;
-                    }
-                }
-                
-                const parentAlias = parentArrayPath ? aliases[parentArrayPath] : (aliases[""] || "src");
-                let relativePath = arrayPath;
-                if (parentArrayPath) {
-                    relativePath = arrayPath.substring(parentArrayPath.length);
-                }
-                if (relativePath.startsWith(PATH_SEP)) relativePath = relativePath.substring(1);
-                
-                let joinExpr;
-                
-                if (relativePath === "[]") {
-                    joinExpr = `"${parentAlias}"`;
-                } else {
-                    let cleanProp = relativePath.replace(/\[\]/g, '');
-                    if (cleanProp.startsWith(PATH_SEP)) cleanProp = cleanProp.substring(1);
-                    const parts = cleanProp ? cleanProp.split(PATH_SEP) : [];
-
-                    if (parentArrayPath === "") {
-                        joinExpr = `"${parentAlias}"."${jsonColumn}".${parts.map(p=>`"${p}"`).join('.')}`;
-                    } else {
-                        joinExpr = `"${parentAlias}".${parts.map(p=>`"${p}"`).join('.')}`;
-                    }
-                }
-                
-                fromClause += `\n    LEFT JOIN ${joinExpr} AS "${alias}" ON TRUE`;
-            });
-            
-            const mainScript = `SET enable_case_sensitive_identifier to TRUE;\nCREATE OR REPLACE VIEW ${viewName} AS\nSELECT\n${selectLines.join(',\n')}\n${fromClause};`;
-            const grants = `\n\n/*\n-- Grant Access Examples:\nGRANT SELECT ON ${viewName} TO "user_name";\nGRANT SELECT ON ${viewName} TO GROUP "group_name";\n*/`;
-            
-            return mainScript + grants;
-        };
-
-        const generateTableDDL = (schema, columnAliases = {}, config = {}) => {
-          if (!schema || schema.length === 0) return "-- No schema detected.";
-          
-          const { tableName = "<schema.table_name>", diststyle = "AUTO", sortKeys = "" } = config; 
-          const smartColAliases = generateUniqueAliases(schema, columnAliases);
-          
-          const columnDefs = schema.map(item => {
-              const colAlias = smartColAliases[item.field];
-              const type = item.type;
-              return `    "${colAlias}" ${type}`;
-          });
-
-          let ddl = `CREATE TABLE ${tableName} (\n${columnDefs.join(',\n')}\n)\nDISTSTYLE ${diststyle}`;
-          
-          if (sortKeys && sortKeys.trim()) {
-              const keys = sortKeys.split(',').map(k => k.trim()).filter(k => k);
-              if (keys.length > 0) {
-                  const quotedKeys = keys.map(k => `"${k}"`).join(', ');
-                  ddl += `\nSORTKEY (${quotedKeys})`;
-              }
-          }
-          
-          ddl += ';';
-          
-          const grants = `\n\n/*\n-- Grant Access Examples:\nGRANT ALL ON ${tableName} TO "user_name";\nGRANT ALL ON ${tableName} TO GROUP "group_name";\n*/`;
-
-          return ddl + grants;
-        };
-
-        // --- UI Helper Components ---
-        // ... (HighlightText, HighlightSql, FormattedField, DataTypeSelect, SortKeySelector, JsonPrimitive components remain unchanged) ...
 
         const HighlightText = React.memo(({ text, highlight }) => {
             const safeText = String(text || '');
@@ -808,7 +768,6 @@
             }
         });
 
-        // Highlights SQL syntax for the script preview
         const HighlightSql = React.memo(({ code, searchTerm }) => {
             const keywords = /\b(SELECT|FROM|WHERE|CAST|AS|LEFT|JOIN|ON|CREATE|OR|REPLACE|VIEW|WITH|NO|SCHEMA|BINDING|GRANT|TO|GROUP|TRUE|FALSE|NULL|TABLE|DISTSTYLE|SORTKEY|DISTKEY|AUTO)\b/gi;
             const types = /\b(VARCHAR|BIGINT|SMALLINT|INTEGER|DECIMAL|REAL|DOUBLE PRECISION|CHAR|TEXT|DATE|TIMESTAMP|TIMESTAMPTZ|BOOLEAN|SUPER|GEOMETRY|VARBYTE)\b/gi;
@@ -845,7 +804,6 @@
             );
         });
 
-        // Formats field paths, highlighting array brackets
         const FormattedField = React.memo(({ path, searchTerm }) => {
           const parts = path.split(PATH_SEP);
           return (
@@ -870,7 +828,6 @@
           );
         });
 
-        // Dropdown for selecting data types
         const DataTypeSelect = React.memo(({ value, originalType, onChange }) => {
           const [isOpen, setIsOpen] = useState(false);
           const [isCustomMode, setIsCustomMode] = useState(false);
@@ -890,18 +847,13 @@
                   setIsOpen(false);
               }
             };
-
             const handleScroll = (event) => {
-                // Close if we scroll a parent, but NOT if we scroll the menu itself.
-                // Guard clause: ensure target is a valid Node before calling contains
                 if (!(event.target instanceof Node)) return;
-                
                 if (menuRef.current && (menuRef.current === event.target || menuRef.current.contains(event.target))) {
                     return;
                 }
                 setIsOpen(false);
             };
-
             if (isOpen) {
                 document.addEventListener('mousedown', handleClickOutside);
                 window.addEventListener('scroll', handleScroll, true); 
@@ -920,10 +872,7 @@
                 const rect = containerRef.current.getBoundingClientRect();
                 const windowHeight = window.innerHeight;
                 const spaceBelow = windowHeight - rect.bottom;
-                
-                // Flip if less than 280px space below
                 const shouldFlip = spaceBelow < 280;
-                
                 setCoords({ 
                     top: shouldFlip ? 'auto' : rect.bottom, 
                     bottom: shouldFlip ? (windowHeight - rect.top) : 'auto',
@@ -1015,7 +964,6 @@
           );
         });
 
-        // Tag input for Sort Keys
         const SortKeySelector = ({ availableColumns, value, onChange }) => {
             const [inputValue, setInputValue] = useState("");
             const [showSuggestions, setShowSuggestions] = useState(false);
@@ -1122,36 +1070,153 @@
             );
         };
 
+        // --- NEW COMPONENT: Searchable Dropdown (Typeahead) ---
+        const SearchableDropdown = ({ options, value, onChange, placeholder = "Select..." }) => {
+            const [isOpen, setIsOpen] = useState(false);
+            const [searchTerm, setSearchTerm] = useState("");
+            const containerRef = useRef(null);
+            
+            // Filter options based on search
+            const filteredOptions = useMemo(() => {
+                if (!searchTerm) return options;
+                return options.filter(opt => opt.toLowerCase().includes(searchTerm.toLowerCase()));
+            }, [options, searchTerm]);
+
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (containerRef.current && !containerRef.current.contains(event.target)) {
+                        setIsOpen(false);
+                    }
+                };
+                document.addEventListener("mousedown", handleClickOutside);
+                return () => document.removeEventListener("mousedown", handleClickOutside);
+            }, []);
+
+            const handleSelect = (val) => {
+                onChange(val);
+                setIsOpen(false);
+                setSearchTerm("");
+            };
+
+            return (
+                <div className="relative w-full" ref={containerRef}>
+                    <div 
+                        className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus-within:ring-2 focus-within:ring-blue-500 cursor-pointer flex items-center justify-between"
+                        onClick={() => setIsOpen(!isOpen)}
+                    >
+                        <span className={`truncate ${!value ? 'text-slate-400' : 'text-slate-700 dark:text-slate-200'}`}>
+                            {value || placeholder}
+                        </span>
+                        <ChevronDown size={14} className="text-slate-400" />
+                    </div>
+
+                    {isOpen && (
+                        <div className="absolute top-full left-0 w-full mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl max-h-60 overflow-hidden z-50 flex flex-col">
+                            <div className="p-2 border-b border-slate-100 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50">
+                                <input 
+                                    type="text" 
+                                    autoFocus
+                                    placeholder="Search columns..." 
+                                    value={searchTerm}
+                                    onChange={(e) => setSearchTerm(e.target.value)}
+                                    className="w-full px-2 py-1 text-xs border border-slate-300 dark:border-slate-600 rounded bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 focus:ring-2 focus:ring-blue-500 outline-none"
+                                />
+                            </div>
+                            <div className="overflow-y-auto custom-scrollbar flex-1">
+                                {filteredOptions.length > 0 ? (
+                                    filteredOptions.map(opt => (
+                                        <div 
+                                            key={opt} 
+                                            onClick={() => handleSelect(opt)}
+                                            className={`px-3 py-2 text-xs cursor-pointer hover:bg-blue-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 truncate ${value === opt ? 'bg-blue-50 dark:bg-blue-900/20 font-medium text-blue-700' : ''}`}
+                                            title={opt}
+                                        >
+                                            {opt}
+                                        </div>
+                                    ))
+                                ) : (
+                                    <div className="px-3 py-4 text-xs text-slate-400 text-center italic">No columns found</div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
         const JsonPrimitive = React.memo(({ value, isLast, searchTerm }) => {
           let type = typeof value;
           let displayValue = String(value);
-          let colorClass = "text-slate-700 dark:text-slate-300"; // Default
-          let isTruncated = false;
+          let colorClass = "text-slate-700 dark:text-slate-300"; 
+          
+          const [isExpanded, setIsExpanded] = useState(false);
+          const isLongString = type === 'string' && value.length > MAX_STRING_LENGTH;
+          
+          // Detect JSON String
+          const isJsonString = useMemo(() => {
+             if (type !== 'string') return false;
+             const trimmed = value.trim();
+             if (trimmed.length < 2) return false;
+             // Simple check before expensive parse
+             if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                 try {
+                     JSON.parse(trimmed);
+                     return true;
+                 } catch (e) { return false; }
+             }
+             return false;
+          }, [value, type]);
 
           if (value === null) {
             type = "null"; displayValue = "null"; colorClass = "text-slate-400 dark:text-slate-500 italic";
           } else if (type === "string") {
-            if (value.length > MAX_STRING_LENGTH && !searchTerm) { 
-              displayValue = `"${value.substring(0, MAX_STRING_LENGTH)}..."`;
-              isTruncated = true;
-            } else {
-              displayValue = `"${value}"`;
-            }
-            colorClass = "text-amber-600 dark:text-amber-400"; // Warm String Color
-          } else if (type === "number") colorClass = "text-emerald-600 dark:text-emerald-400"; // Green for Numbers
-          else if (type === "boolean") colorClass = "text-blue-600 dark:text-blue-400 font-semibold"; // Blue for Booleans
+            displayValue = value;
+            colorClass = "text-amber-600 dark:text-amber-400"; 
+          } else if (type === "number") colorClass = "text-emerald-600 dark:text-emerald-400";
+          else if (type === "boolean") colorClass = "text-blue-600 dark:text-blue-400 font-semibold";
+
+          const toggleExpand = (e) => {
+              if (isLongString && !searchTerm) {
+                  e.stopPropagation();
+                  setIsExpanded(!isExpanded);
+              }
+          };
 
           return (
-            <span className="font-mono text-sm group relative">
-              <span className={colorClass}>
-                {type === "string" && !isTruncated ? <>"<HighlightText text={value} highlight={searchTerm} />"</> : <HighlightText text={displayValue} highlight={searchTerm} />}
-              </span>
+            <span className="font-mono text-sm group relative inline-flex items-baseline">
+              {type === "string" ? (
+                  <>
+                      {isJsonString && (
+                          <span className="mr-2 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-200 border border-amber-200 dark:border-amber-800 select-none cursor-help whitespace-nowrap" title="This string contains valid JSON data">
+                              JSON String
+                          </span>
+                      )}
+                      <span 
+                        className={`${colorClass} ${isLongString && !searchTerm ? 'cursor-pointer hover:underline decoration-dotted decoration-amber-400/50' : ''}`}
+                        onClick={toggleExpand}
+                        title={isLongString && !searchTerm ? (isExpanded ? "Click to collapse" : "Click to expand") : ""}
+                      >
+                          "
+                          <HighlightText 
+                            text={isLongString && !searchTerm && !isExpanded ? value.substring(0, MAX_STRING_LENGTH) : value} 
+                            highlight={searchTerm} 
+                          />
+                          {isLongString && !searchTerm && !isExpanded && (
+                              <span className="inline-block mx-1 px-1 bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-400 text-[10px] rounded select-none">...</span>
+                          )}
+                          "
+                      </span>
+                  </>
+              ) : (
+                  <span className={colorClass}>
+                    <HighlightText text={displayValue} highlight={searchTerm} />
+                  </span>
+              )}
               {!isLast && <span className="text-slate-400 dark:text-slate-500">,</span>}
             </span>
           );
         });
 
-        // Recursive component for Tree View
         const JsonNode = React.memo(({ name, value, isLast, depth = 0, expandSignal, searchTerm }) => {
           const [isExpanded, setIsExpanded] = useState(false);
           const [showAllItems, setShowAllItems] = useState(false);
@@ -1272,16 +1337,12 @@
           );
         });
 
-        // --- Data Preview Component (Virtualized) ---
-        // Renders only visible rows to handle large datasets efficiently.
-        // Concept: A large empty div sets the scroll height, and a smaller absolutely positioned
-        // table renders just the subset of rows currently in the viewport.
-        const DataPreview = ({ data, columns }) => {
+        // Wrapped in React.memo for performance (only re-render if data/columns change)
+        const DataPreview = React.memo(({ data, columns, columnMetadata, searchTerm }) => {
             const parentRef = useRef(null);
             const [scrollTop, setScrollTop] = useState(0);
             const [containerHeight, setContainerHeight] = useState(0);
 
-            // Observe container resize to update virtualization calcs
             useEffect(() => {
                 if (!parentRef.current) return;
                 const resizeObserver = new ResizeObserver(entries => {
@@ -1292,6 +1353,33 @@
                 resizeObserver.observe(parentRef.current);
                 return () => resizeObserver.disconnect();
             }, []);
+
+            const filteredData = useMemo(() => {
+                if (!data) return [];
+                let result = data;
+
+                // Apply Global Search
+                if (searchTerm && searchTerm.trim()) {
+                    const lowerTerm = searchTerm.toLowerCase();
+                    result = result.filter(row => {
+                        return columns.some(col => {
+                            const val = row[col];
+                            if (val === null || val === undefined) return false;
+                            return String(val).toLowerCase().includes(lowerTerm);
+                        });
+                    });
+                }
+
+                return result;
+            }, [data, searchTerm, columns]);
+
+            // Reset scroll when data length changes (e.g. searching)
+            useEffect(() => {
+                if (parentRef.current) {
+                    parentRef.current.scrollTop = 0;
+                    setScrollTop(0);
+                }
+            }, [filteredData.length, searchTerm]);
 
             const handleScroll = (e) => {
                 const target = e.target;
@@ -1306,19 +1394,17 @@
 
             if (!data || data.length === 0) return <div className="p-8 text-center text-slate-400">No data available. Check your schema selection.</div>;
 
-            // Virtualization Math
-            const rowHeight = 35; // Fixed height for rows
-            const headerHeight = 40; // Height of the sticky header
+            const rowHeight = 35; 
+            const headerHeight = 45; 
             const effectiveHeight = containerHeight || 500;
-            const totalRows = data.length;
-            const visibleRows = Math.ceil(effectiveHeight / rowHeight);
+            const totalRows = filteredData.length;
+            const visibleRowsCount = Math.ceil(effectiveHeight / rowHeight);
             
-            // Calculate indices
-            const scrollOffset = Math.max(0, scrollTop - headerHeight);
-            const startIndex = Math.max(0, Math.floor(scrollOffset / rowHeight) - 2); // Buffer
-            const endIndex = Math.min(totalRows, startIndex + visibleRows + 20); // Increased Buffer
+            const scrollOffset = Math.max(0, scrollTop); 
+            const startIndex = Math.max(0, Math.floor(scrollOffset / rowHeight) - 2); 
+            const endIndex = Math.min(totalRows, startIndex + visibleRowsCount + 20); 
 
-            const visibleData = data.slice(startIndex, endIndex);
+            const visibleData = filteredData.slice(startIndex, endIndex);
             const topSpacerHeight = startIndex * rowHeight;
             const bottomSpacerHeight = Math.max(0, (totalRows - endIndex) * rowHeight);
 
@@ -1329,14 +1415,22 @@
                     onScroll={handleScroll}
                 >
                     <table className="min-w-full border-collapse text-left whitespace-nowrap">
-                        <thead className="bg-slate-100 dark:bg-slate-800 sticky top-0 z-10 shadow-sm h-[40px]">
+                        <thead className="bg-slate-50 dark:bg-slate-800 sticky top-0 z-40 shadow-sm">
                             <tr>
-                                <th className="p-3 text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 w-16 text-center">#</th>
-                                {columns.map((col, idx) => (
-                                    <th key={idx} className="p-3 text-xs font-semibold text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-600 bg-slate-100 dark:bg-slate-800 min-w-[150px]">
-                                        {col}
-                                    </th>
-                                ))}
+                                <th className="p-2 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider border-b border-r border-slate-200 dark:border-slate-700 w-12 text-center h-[45px]">
+                                    #
+                                </th>
+                                {columns.map((col, idx) => {
+                                    return (
+                                        <th key={idx} className="group relative p-0 text-xs font-semibold text-slate-700 dark:text-slate-200 border-b border-r border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 min-w-[150px] h-[45px] select-none hover:bg-slate-100 dark:hover:bg-slate-700/50 transition-colors">
+                                            <div className="flex items-center justify-between px-3 h-full w-full">
+                                                <div className="flex flex-col truncate pr-2">
+                                                     <span className="truncate block" title={col}>{col}</span>
+                                                </div>
+                                            </div>
+                                        </th>
+                                    );
+                                })}
                             </tr>
                         </thead>
                         <tbody className="bg-white dark:bg-slate-900">
@@ -1349,11 +1443,15 @@
                                 const rowIndex = startIndex + i;
                                 const isEven = rowIndex % 2 === 0;
                                 return (
-                                    <tr key={rowIndex} className={`hover:bg-blue-50 dark:hover:bg-slate-800/50 transition-colors h-[35px] ${isEven ? 'bg-white dark:bg-slate-900' : 'bg-slate-50 dark:bg-slate-800/30'}`}>
-                                        <td className="p-2 text-xs text-slate-500 font-mono text-center border border-slate-300 dark:border-slate-600 bg-slate-100/50 dark:bg-slate-800/50 truncate">{rowIndex + 1}</td>
+                                    <tr key={rowIndex} className={`hover:bg-blue-50 dark:hover:bg-slate-800/50 transition-colors h-[35px] ${isEven ? 'bg-white dark:bg-slate-900' : 'bg-slate-50/50 dark:bg-slate-800/30'}`}>
+                                        <td className="p-2 text-xs text-slate-400 font-mono text-center border-b border-r border-slate-100 dark:border-slate-800 truncate">{rowIndex + 1}</td>
                                         {columns.map((col, j) => (
-                                            <td key={j} className="p-2 text-xs font-mono text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-600 min-w-[150px] max-w-xs truncate" title={String(row[col])}>
-                                                {row[col] === null ? <span className="text-slate-400 italic">null</span> : String(row[col])}
+                                            <td key={j} className="p-2 text-xs font-mono text-slate-700 dark:text-slate-300 border-b border-r border-slate-100 dark:border-slate-800 min-w-[150px] max-w-xs truncate" title={String(row[col])}>
+                                                {row[col] === null ? (
+                                                    <span className="text-slate-300 dark:text-slate-600 italic">null</span>
+                                                ) : (
+                                                    <HighlightText text={String(row[col])} highlight={searchTerm} />
+                                                )}
                                             </td>
                                         ))}
                                     </tr>
@@ -1364,13 +1462,21 @@
                                     <td colSpan={columns.length + 1} style={{ height: bottomSpacerHeight, padding: 0, border: 0 }}></td>
                                 </tr>
                             )}
+                            {filteredData.length === 0 && (
+                                <tr>
+                                    <td colSpan={columns.length + 1} className="p-12 text-center">
+                                        <div className="flex flex-col items-center justify-center text-slate-400">
+                                            <p>No records match the current search.</p>
+                                        </div>
+                                    </td>
+                                </tr>
+                            )}
                         </tbody>
                     </table>
                 </div>
             );
-        };
+        });
 
-        // Reconstructs a hierarchical tree from a flat list of paths
         const buildSchemaTree = (flatSchema) => {
             const root = { name: 'root', children: {}, items: [] };
             flatSchema.forEach(item => {
@@ -1394,39 +1500,25 @@
             return root;
         };
 
-        const collectNodeFields = (node) => {
-            let fields = [];
-            if (node.items) node.items.forEach(i => fields.push(i.field));
-            if (node.children) Object.values(node.children).forEach(child => fields.push(...collectNodeFields(child)));
-            return fields;
-        };
-
         const collectMatchingNodeFields = (node, searchTerm, effectiveAliases) => {
             let fields = [];
-            
-            // If no search term, collect all fields (standard behavior)
             if (!searchTerm) {
                 if (node.items) node.items.forEach(i => fields.push(i.field));
                 if (node.children) Object.values(node.children).forEach(child => fields.push(...collectMatchingNodeFields(child, searchTerm, effectiveAliases)));
                 return fields;
             }
-
             const lowerTerm = searchTerm.toLowerCase();
-
-            // Check match for specific item
             const isMatch = (item) => {
                  const alias = effectiveAliases && effectiveAliases[item.field] ? effectiveAliases[item.field] : "";
                  return item.field.toLowerCase().includes(lowerTerm) || 
                         item.type.toLowerCase().includes(lowerTerm) ||
                         alias.toLowerCase().includes(lowerTerm);
             }
-
             if (node.items) {
                 node.items.forEach(i => {
                     if (isMatch(i)) fields.push(i.field);
                 });
             }
-            
             if (node.children) {
                 Object.values(node.children).forEach(child => {
                     fields.push(...collectMatchingNodeFields(child, searchTerm, effectiveAliases));
@@ -1435,25 +1527,16 @@
             return fields;
         };
 
-        // --- Optimized SchemaView with Virtualization ---
-        // A complex component that renders the schema as a tree table.
-        // It supports bulk selection, type editing, and renaming.
-        // It uses the same virtualization technique as DataPreview.
+        // Wrapped in React.memo for performance
         const SchemaRow = React.memo(({ item, type, depth, onTypeChange, searchTerm, onSelect, isSelected, columnAliases, onColumnAliasChange, isExcluded, onToggle, isExpanded, selectionState, effectiveAliases }) => {
             const currentAlias = columnAliases[item.field || item.path] || "";
             const isNode = type === 'node';
-            
-            // Only leaves have selection and type change
             const canSelect = !isNode;
-            
-            // Visual Indentation for Tree Structure
             const paddingLeft = depth * 20 + 8;
             
             const handleSelectChange = () => {
                 if (isNode) {
-                    // Use filtered collection to only select visible items
                     const fields = collectMatchingNodeFields(item, searchTerm, effectiveAliases);
-                    // Toggle: if currently fully selected (all), deselect all. Otherwise select all.
                     onSelect(fields, selectionState !== 'all'); 
                 } else {
                     onSelect([item.field], !isSelected);
@@ -1461,16 +1544,10 @@
             };
 
             const placeholder = isNode ? "" : (effectiveAliases[item.field] || "Alias");
-
-            // Define visual style for excluded content columns (excludes checkbox)
             const excludedStyle = isExcluded ? 'opacity-40 grayscale' : '';
             
             return (
-                <div 
-                    // Removed global opacity/grayscale class here so checkbox stays clear
-                    className={`flex items-center border-b border-slate-100 dark:border-slate-800 h-[35px] hover:bg-slate-50 dark:hover:bg-slate-800/30 transition-colors group ${isSelected || (isNode && selectionState === 'all') ? 'bg-blue-50/50 dark:bg-blue-900/20' : ''}`}
-                >
-                    {/* Checkbox Column */}
+                <div className={`flex items-center border-b border-slate-100 dark:border-slate-800 h-[35px] hover:bg-slate-50 dark:hover:bg-slate-800/30 transition-colors group ${isSelected || (isNode && selectionState === 'all') ? 'bg-blue-50/50 dark:bg-blue-900/20' : ''}`}>
                     <div className="w-10 flex-shrink-0 flex items-center justify-center border-r border-slate-100 dark:border-slate-800 h-full bg-slate-50/30 dark:bg-slate-800/10">
                          <div 
                             className="w-4 h-4 rounded border border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700 cursor-pointer flex items-center justify-center bg-white dark:bg-gray-800 transition-colors hover:border-blue-400"
@@ -1485,9 +1562,7 @@
                          </div>
                     </div>
 
-                    {/* Field Name Column - Applied excludedStyle */}
                     <div className={`flex-1 flex items-center h-full min-w-[200px] overflow-hidden px-2 relative ${excludedStyle}`}>
-                         {/* Guide lines for Tree depth */}
                          {Array.from({ length: depth }).map((_, i) => (
                             <div 
                                 key={i} 
@@ -1496,10 +1571,10 @@
                             />
                         ))}
                         
-                        <div style={{ paddingLeft: `${depth * 20}px` }} className="flex items-center gap-2 pl-2 w-full">
+                        <div style={{ paddingLeft: `${depth * 20}px` }} className="flex items-center gap-2 pl-2 w-full h-full">
                             {isNode ? (
                                 <div 
-                                    className="flex items-center gap-2 cursor-pointer select-none group/toggle text-slate-700 dark:text-slate-200 font-semibold text-sm hover:text-blue-600 dark:hover:text-blue-400"
+                                    className="flex items-center gap-2 cursor-pointer select-none group/toggle text-slate-700 dark:text-slate-200 font-semibold text-sm hover:text-blue-600 dark:hover:text-blue-400 w-full h-full"
                                     onClick={() => onToggle(item.path)}
                                     title={item.name}
                                 >
@@ -1507,23 +1582,26 @@
                                         {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                                     </span>
                                     <span className="flex items-center gap-1.5 truncate">
-                                        {/* Folder Icons Removed as requested */}
                                         <HighlightText text={item.name} highlight={searchTerm} />
                                     </span>
                                 </div>
                             ) : (
                                 <div 
-                                    className="flex items-center gap-2 text-sm font-mono text-purple-700 dark:text-purple-400 truncate pl-6 relative"
+                                    className="flex items-center gap-2 text-sm font-mono text-purple-700 dark:text-purple-400 truncate pl-6 relative h-full w-full"
                                     title={item.displayName || item.field}
                                 >
                                      <span className="text-slate-300 dark:text-slate-600 absolute left-1 top-1/2 -translate-y-1/2">└</span>
                                      <FormattedField path={item.displayName || item.field} searchTerm={searchTerm} />
+                                     {item.isJson && (
+                                        <span className="ml-1 px-1 rounded text-[9px] bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200 font-bold border border-amber-200 dark:border-amber-800 whitespace-nowrap">
+                                            JSON String
+                                        </span>
+                                     )}
                                 </div>
                             )}
                         </div>
                     </div>
 
-                    {/* Type Column - Applied excludedStyle */}
                     <div className={`w-[15%] min-w-[120px] flex items-center px-2 h-full ${excludedStyle}`}>
                         {isNode ? (
                             item.isArray && <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">Array</span>
@@ -1534,12 +1612,11 @@
                         )}
                     </div>
                     
-                    {/* Alias Column - Applied excludedStyle */}
                     <div className={`w-[25%] min-w-[140px] flex items-center px-2 h-full ${excludedStyle}`}>
                          {!isNode && (
                             <input 
                                 type="text" 
-                                placeholder={placeholder} // Use passed effective alias
+                                placeholder={placeholder}
                                 value={currentAlias}
                                 disabled={isExcluded}
                                 onFocus={(e) => {
@@ -1549,11 +1626,10 @@
                                     const target = e.target;
                                     setTimeout(() => {
                                         target.setSelectionRange(target.value.length, target.value.length);
-                                        target.scrollLeft = target.scrollWidth; // Force view to scroll to end
+                                        target.scrollLeft = target.scrollWidth;
                                     }, 0);
                                 }}
                                 onChange={(e) => {
-                                    // Sanitize input immediately
                                     const rawVal = e.target.value;
                                     const sanitizedVal = sanitizeSqlIdentifier(rawVal);
                                     onColumnAliasChange({...columnAliases, [item.field]: sanitizedVal});
@@ -1563,7 +1639,6 @@
                          )}
                     </div>
                     
-                    {/* Sample Column - Applied excludedStyle */}
                     <div className={`w-[20%] min-w-[100px] flex items-center px-2 h-full text-xs text-slate-500 font-mono truncate border-l border-slate-100 dark:border-slate-800 ${excludedStyle}`}>
                         {!isNode && JSON.stringify(item.sample)}
                     </div>
@@ -1571,13 +1646,13 @@
             );
         });
 
-        const SchemaView = ({ schema, onTypeChange, searchTerm, expandSignal, columnAliases, onColumnAliasChange, effectiveAliases, excludedFields, selectedFields, onSelect, onSelectAll }) => {
+        // Wrapped in React.memo for performance
+        const SchemaView = React.memo(({ schema, onTypeChange, searchTerm, expandSignal, columnAliases, onColumnAliasChange, effectiveAliases, excludedFields, selectedFields, onSelect, onSelectAll }) => {
             const [expandedPaths, setExpandedPaths] = useState(new Set(['root']));
             const parentRef = useRef(null);
             const [scrollTop, setScrollTop] = useState(0);
             const [containerHeight, setContainerHeight] = useState(0);
 
-            // Resize observer to handle dynamic container height for virtualization
             useEffect(() => {
                 if (!parentRef.current) return;
                 const resizeObserver = new ResizeObserver(entries => {
@@ -1623,26 +1698,49 @@
                         setExpandedPaths(new Set(['root']));
                     }
                 }
-                // REMOVED 'schema' from dependency array to prevent auto-expansion on data type changes
             }, [expandSignal]);
 
-            // Memoized Flattening Logic: Converts tree to flat list for virtualization
+            useEffect(() => {
+                if (searchTerm) {
+                    const newExpanded = new Set(['root']);
+                    const lowerTerm = searchTerm.toLowerCase();
+                    const checkAndExpand = (node) => {
+                        let hasMatch = false;
+                        if (node.items) {
+                            const itemMatch = node.items.some(item => {
+                                const alias = effectiveAliases[item.field] || "";
+                                return item.field.toLowerCase().includes(lowerTerm) || 
+                                        item.type.toLowerCase().includes(lowerTerm) ||
+                                        alias.toLowerCase().includes(lowerTerm);
+                            });
+                            if (itemMatch) hasMatch = true;
+                        }
+                        if (node.children) {
+                            Object.values(node.children).forEach(child => {
+                                if (checkAndExpand(child)) hasMatch = true;
+                            });
+                        }
+                        if (node.name !== 'root' && node.name.toLowerCase().includes(lowerTerm)) hasMatch = true;
+                        if (hasMatch && node.path) newExpanded.add(node.path);
+                        return hasMatch;
+                    };
+                    const root = buildSchemaTree(schema);
+                    checkAndExpand(root);
+                    setExpandedPaths(newExpanded);
+                }
+            }, [searchTerm, schema, effectiveAliases]);
+
             const flatRows = useMemo(() => {
                 if (!schema) return [];
                 const treeRoot = buildSchemaTree(schema);
                 const rows = [];
-                
                 const flatten = (node, depth) => {
                     if (node.name !== 'root') {
                          rows.push({ type: 'node', data: node, depth });
                     }
-                    
-                    // Only traverse children if node is expanded OR if we are searching (search shows deep matches)
-                    if (node.name === 'root' || expandedPaths.has(node.path) || searchTerm) {
+                    if (node.name === 'root' || expandedPaths.has(node.path)) {
                          node.items.forEach(item => {
-                             // Inject effective alias into item data for row to use
                              const itemWithAlias = { ...item, effectiveAlias: effectiveAliases[item.field] };
-                             // Check search filter for items
                              const lowerTerm = searchTerm.toLowerCase();
                              if (!searchTerm || 
                                  item.field.toLowerCase().includes(lowerTerm) || 
@@ -1657,17 +1755,13 @@
                          });
                     }
                 };
-                
                 flatten(treeRoot, 0);
                 return rows;
             }, [schema, expandedPaths, searchTerm, effectiveAliases]);
 
-            // Logic: Calculate all filterable leaf items independent of view state (expansion)
-            // This ensures the "Select All" checkbox selects hidden items too.
             const allFilteredLeaves = useMemo(() => {
                 if (!schema) return [];
                 if (!searchTerm) return schema;
-                
                 const lowerTerm = searchTerm.toLowerCase();
                 return schema.filter(item => {
                      const alias = effectiveAliases[item.field] || "";
@@ -1685,23 +1779,19 @@
 
             if (!schema) return <div className="text-gray-500 p-4">No data to analyze.</div>;
 
-            // Virtualization Props
             const rowHeight = 35;
             const effectiveHeight = containerHeight || 500;
             const totalRows = flatRows.length;
-            const visibleRowCount = Math.ceil(effectiveHeight / rowHeight);
+            const visibleRowsCount = Math.ceil(effectiveHeight / rowHeight);
             
             const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - 5);
-            const endIndex = Math.min(totalRows, startIndex + visibleRowCount + 10);
+            const endIndex = Math.min(totalRows, startIndex + visibleRowsCount + 10);
             
             const visibleRows = flatRows.slice(startIndex, endIndex);
             const topSpacerHeight = startIndex * rowHeight;
-            // Fix bottom spacer calc to avoid negative
             const bottomSpacerHeight = Math.max(0, (totalRows - endIndex) * rowHeight);
 
-            // Helper to calculate node selection state for the row
             const getNodeSelectionState = (node) => {
-                // Use filtered collection to determine state based on visible items
                 const fields = collectMatchingNodeFields(node, searchTerm, effectiveAliases);
                 if (fields.length === 0) return 'none';
                 const allSelected = fields.every(f => selectedFields.has(f));
@@ -1712,7 +1802,6 @@
 
             return (
                 <div className="flex flex-col h-full">
-                    {/* Header */}
                     <div className="flex-none bg-slate-50 dark:bg-slate-800/50 text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-slate-700 h-[40px] flex items-center text-xs font-semibold">
                          <div className="w-10 text-center border-r border-slate-200 dark:border-slate-700 h-full flex items-center justify-center">
                             <input type="checkbox" onChange={handleSelectAllFiltered} checked={areAllFilteredSelected} className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700 cursor-pointer" />
@@ -1723,7 +1812,6 @@
                          <div className="w-[20%] min-w-[100px] px-2 uppercase tracking-wider">Sample</div>
                     </div>
                     
-                    {/* Virtualized Body */}
                     <div 
                         ref={parentRef}
                         className="flex-1 overflow-auto bg-white dark:bg-slate-900 virtual-list-container"
@@ -1733,7 +1821,7 @@
                              <div style={{ position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${topSpacerHeight}px)` }}>
                                 {visibleRows.map((row, i) => (
                                     <SchemaRow 
-                                        key={row.type === 'node' ? row.data.path : row.data.field}
+                                        key={row.type === 'node' ? `node-${row.data.path}` : `leaf-${row.data.field}`}
                                         item={row.data}
                                         type={row.type}
                                         depth={row.depth}
@@ -1756,58 +1844,107 @@
                     </div>
                 </div>
             );
-        };
+        });
 
-        const ScriptView = ({ schema, columnAliases, onColumnAliasChange, searchTerm, effectiveAliases }) => {
+        // Wrapped in React.memo for performance
+        const ScriptView = React.memo(({ schema, columnAliases, onColumnAliasChange, searchTerm, effectiveAliases }) => {
             const [sqlScript, setSqlScript] = useState('');
             const [scriptMode, setScriptMode] = useState('view'); 
             const [copied, setCopied] = useState(false);
             const [showSettings, setShowSettings] = useState(true); 
+            const [loading, setLoading] = useState(false); 
             const sqlViewRef = useRef(null);
+            
+            // State for configuration
             const [config, setConfig] = useState({ 
                 sourceTable: "raw_data.source_table", 
                 viewName: "schema.vw_data", 
                 tableName: "schema.table_name", 
                 jsonColumn: "data", 
                 diststyle: "AUTO", 
+                distKey: "",
                 sortKeys: "" 
             });
 
+            // DEBOUNCE CONFIG: Wait 500ms after user stops typing/clicking before regenerating heavy SQL
+            const debouncedConfig = useDebounce(config, 500);
+
+            // CACHE STATE
+            const [scriptCache, setScriptCache] = useState({ view: null, ddl: null });
+
+            // Memoize available columns to prevent flicker
             const availableColumns = useMemo(() => Object.values(effectiveAliases), [effectiveAliases]);
 
+            // 1. Invalidate cache if schema or aliases change (immediate)
+            useEffect(() => {
+                setScriptCache({ view: null, ddl: null });
+            }, [schema, columnAliases]);
+
+            // 1b. Invalidate cache if DEBOUNCED config changes
+            useEffect(() => {
+                 setScriptCache(prev => ({ ...prev, [scriptMode]: null }));
+            }, [debouncedConfig, scriptMode]);
+
+            // 2. Generate script only if NOT in cache, using DEBOUNCED config
             useEffect(() => { 
-                if(schema) {
-                    if (scriptMode === 'view') {
-                        setSqlScript(generateSqlScript(schema, {}, columnAliases, config));
-                    } else {
-                        setSqlScript(generateTableDDL(schema, columnAliases, config));
+                if(!schema) return;
+
+                // Check cache first (using current mode)
+                // Note: We check if the cache entry exists AND matches current needs. 
+                // Since we invalidate cache on config change, a null cache means "needs update".
+                if (scriptCache[scriptMode] !== null) {
+                    setSqlScript(scriptCache[scriptMode]);
+                    return;
+                }
+                
+                setLoading(true); // Start loading
+                const worker = createWorker();
+                worker.postMessage({
+                    type: 'GENERATE_SQL',
+                    payload: {
+                        schema,
+                        mode: scriptMode,
+                        columnAliases,
+                        config: debouncedConfig // Use debounced config here
                     }
-                } 
-            }, [schema, columnAliases, config, scriptMode]);
+                });
+
+                worker.onmessage = (e) => {
+                    if (e.data.type === 'SQL_SUCCESS') {
+                        const result = e.data.payload;
+                        setSqlScript(result);
+                        setScriptCache(prev => ({
+                            ...prev,
+                            [scriptMode]: result
+                        }));
+                    }
+                    setLoading(false); // Stop loading
+                    worker.terminate();
+                };
+                
+                return () => worker.terminate();
+            }, [schema, columnAliases, debouncedConfig, scriptMode, scriptCache]);
 
             const handleCopy = () => {
                 const textArea = document.createElement("textarea");
-                textArea.value = sqlScript;
+                textArea.value = sqlScript || '';
                 textArea.style.position = "fixed";
                 textArea.style.left = "-9999px";
                 textArea.style.top = "0";
                 document.body.appendChild(textArea);
                 textArea.focus();
                 textArea.select();
-                
                 try {
                     document.execCommand('copy');
                     setCopied(true);
                     setTimeout(() => setCopied(false), 2000);
-                } catch (err) {
-                    console.error('Failed to copy text', err);
-                }
+                } catch (err) {}
                 document.body.removeChild(textArea);
             };
 
             const handleDownload = () => {
                 const element = document.createElement("a");
-                const file = new Blob([sqlScript], {type: 'text/plain'});
+                const file = new Blob([sqlScript || ''], {type: 'text/plain'});
                 element.href = URL.createObjectURL(file);
                 
                 let filename = "";
@@ -1876,63 +2013,87 @@
                     {showSettings && (
                         <div className="bg-slate-50 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 p-0 animate-in fade-in slide-in-from-top-2 relative z-10 shadow-sm">
                             <div className="absolute top-0 left-[22px] -translate-y-[50%] w-3 h-3 bg-slate-50 dark:bg-slate-800 border-l border-t border-slate-200 dark:border-slate-700 rotate-45 z-20"></div>
-                            <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                                {scriptMode === 'view' && (
-                                    <>
+                            <div className="p-4">
+                                {scriptMode === 'view' ? (
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                                         <div><label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Source Table</label><input type="text" value={config.sourceTable} onChange={(e) => setConfig({...config, sourceTable: e.target.value})} className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono" /></div>
                                         <div><label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">JSON Column Name</label><input type="text" value={config.jsonColumn} onChange={(e) => setConfig({...config, jsonColumn: e.target.value})} className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono" /></div>
-                                    </>
-                                )}
-                                <div>
-                                    <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
-                                        {scriptMode === 'view' ? 'Target View Name' : 'Target Table Name'}
-                                    </label>
-                                    <input 
-                                        type="text" 
-                                        value={scriptMode === 'view' ? config.viewName : config.tableName} 
-                                        onChange={(e) => setConfig({
-                                            ...config, 
-                                            [scriptMode === 'view' ? 'viewName' : 'tableName']: e.target.value
-                                        })} 
-                                        className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono" 
-                                    />
-                                </div>
-                                {scriptMode === 'ddl' && (
-                                    <>
                                         <div>
-                                            <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Diststyle</label>
-                                            <select 
-                                                value={config.diststyle} 
-                                                onChange={(e) => setConfig({...config, diststyle: e.target.value})}
-                                                className="w-32 px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono"
-                                            >
-                                                <option value="AUTO">AUTO</option>
-                                                <option value="EVEN">EVEN</option>
-                                                <option value="KEY">KEY</option>
-                                                <option value="ALL">ALL</option>
-                                            </select>
-                                        </div>
-                                        <div>
-                                            <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Sort Keys</label>
-                                            <SortKeySelector 
-                                                availableColumns={availableColumns}
-                                                value={config.sortKeys}
-                                                onChange={(newVal) => setConfig({...config, sortKeys: newVal})}
+                                            <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Target View Name</label>
+                                            <input 
+                                                type="text" 
+                                                value={config.viewName} 
+                                                onChange={(e) => setConfig({...config, viewName: e.target.value})} 
+                                                className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono" 
                                             />
                                         </div>
-                                    </>
+                                    </div>
+                                ) : (
+                                    <div className="flex flex-col gap-4">
+                                        <div className="flex gap-4 items-end flex-wrap">
+                                            <div className="w-[240px]">
+                                                <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Target Table Name</label>
+                                                <input 
+                                                    type="text" 
+                                                    value={config.tableName} 
+                                                    onChange={(e) => setConfig({...config, tableName: e.target.value})} 
+                                                    className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono" 
+                                                />
+                                            </div>
+                                            <div className="w-32">
+                                                <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Diststyle</label>
+                                                <select 
+                                                    value={config.diststyle} 
+                                                    onChange={(e) => setConfig({...config, diststyle: e.target.value})}
+                                                    className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono"
+                                                >
+                                                    <option value="AUTO">AUTO</option>
+                                                    <option value="EVEN">EVEN</option>
+                                                    <option value="KEY">KEY</option>
+                                                    <option value="ALL">ALL</option>
+                                                </select>
+                                            </div>
+                                            {config.diststyle === 'KEY' && (
+                                                <div className="w-48 animate-in fade-in slide-in-from-left-2 duration-200">
+                                                    <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Dist Key Column</label>
+                                                    <SearchableDropdown 
+                                                        options={availableColumns}
+                                                        value={config.distKey}
+                                                        onChange={(val) => setConfig({...config, distKey: val})}
+                                                        placeholder="Select Column..."
+                                                    />
+                                                </div>
+                                            )}
+                                            <div className="flex-1 min-w-[300px]">
+                                                <label className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">Sort Keys</label>
+                                                <SortKeySelector 
+                                                    availableColumns={availableColumns}
+                                                    value={config.sortKeys}
+                                                    onChange={(newVal) => setConfig({...config, sortKeys: newVal})}
+                                                />
+                                            </div>
+                                        </div>
+                                    </div>
                                 )}
                             </div>
                         </div>
                     )}
                     <div className="relative flex-1 overflow-hidden" ref={sqlViewRef}>
+                        {loading && (
+                            <div className="absolute inset-0 bg-white/80 dark:bg-slate-900/80 backdrop-blur-sm z-30 flex items-center justify-center">
+                                <div className="flex flex-col items-center gap-2">
+                                    <Loader2 size={32} className="text-blue-500 animate-spin" />
+                                    <span className="text-sm font-medium text-slate-600 dark:text-slate-300">Generating Script...</span>
+                                </div>
+                            </div>
+                        )}
                         <pre className="h-full p-4 bg-slate-50 dark:bg-slate-900 text-slate-700 dark:text-slate-300 font-mono text-xs leading-relaxed overflow-auto whitespace-pre-wrap">
-                            <HighlightSql code={sqlScript} searchTerm={searchTerm} />
+                            <HighlightSql code={sqlScript || ''} searchTerm={searchTerm} />
                         </pre>
                     </div>
                 </div>
             );
-        };
+        });
 
         // --- Main Application Component ---
 
@@ -1943,31 +2104,28 @@
           const [isDragging, setIsDragging] = useState(false);
           const [loading, setLoading] = useState(false);
           const [loadingProgress, setLoadingProgress] = useState({ status: '', percent: 0 });
+          const [pastedContent, setPastedContent] = useState(''); // New state for pasted text
           
-          // State for file parsing & view modes
           const [isArrayMode, setIsArrayMode] = useState(false);
           const [currentPage, setCurrentPage] = useState(0);
           const [totalPages, setTotalPages] = useState(0);
           
-          // Signals for expanding/collapsing tree nodes (broadcast events)
           const [expandSignal, setExpandSignal] = useState(null);
           const [schemaExpandSignal, setSchemaExpandSignal] = useState(null);
           
-          // Schema & Selection State
           const [schemaData, setSchemaData] = useState(null);
           const [tableAliases, setTableAliases] = useState({}); 
           const [columnAliases, setColumnAliases] = useState({});
           const [excludedFields, setExcludedFields] = useState(new Set()); 
           const [selectedFields, setSelectedFields] = useState(new Set());
           
-          // UI State
           const [searchTerm, setSearchTerm] = useState(''); 
           const [isDarkMode, setIsDarkMode] = useState(false); 
-          const [viewMode, setViewMode] = useState('tree'); // 'tree' | 'schema' | 'script'
+          const [viewMode, setViewMode] = useState('tree'); 
           const [useSampling, setUseSampling] = useState(true); 
           const [flattenedData, setFlattenedData] = useState(null);
-          const [previewMode, setPreviewMode] = useState('json'); // 'json' | 'table'
-          const [previewLimit, setPreviewLimit] = useState(true); // Toggle state: true = 100 limit, false = 5000 limit
+          const [previewMode, setPreviewMode] = useState('json');
+          const [previewLimit, setPreviewLimit] = useState(true); 
           const [totalRecords, setTotalRecords] = useState(null);
 
           const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(true); 
@@ -1975,22 +2133,34 @@
           const debouncedSearchTerm = useDebounce(searchTerm, 300);
           const fileInputRef = useRef(null);
           
-          // Filter schema based on exclusions
           const activeSchema = useMemo(() => {
               if (!schemaData) return null;
               if (excludedFields.size === 0) return schemaData;
               return schemaData.filter(item => !excludedFields.has(item.field));
           }, [schemaData, excludedFields]);
 
-          // Recalculate aliases when schema changes or user edits aliases
           const effectiveAliases = useMemo(() => generateUniqueAliases(activeSchema, columnAliases), [activeSchema, columnAliases]);
+          
+          // Optimization: Memoize the columns array passed to DataPreview to prevent re-renders when App re-renders
+          const previewColumns = useMemo(() => Object.values(effectiveAliases), [effectiveAliases]);
 
           const allSelectedAreExcluded = useMemo(() => {
               const selectedCount = selectedFields.size;
               return selectedCount > 0 && Array.from(selectedFields).every(f => excludedFields.has(f));
           }, [selectedFields, excludedFields]);
 
-          // Dark Mode Toggle Effect
+          const columnMetadata = useMemo(() => {
+              const meta = {};
+              if (!activeSchema) return meta;
+              activeSchema.forEach(item => {
+                  const alias = effectiveAliases[item.field];
+                  if (alias) {
+                      meta[alias] = { type: item.type, isJson: item.isJson };
+                  }
+              });
+              return meta;
+          }, [activeSchema, effectiveAliases]);
+
           useEffect(() => {
             if (isDarkMode) document.documentElement.classList.add('dark');
             else document.documentElement.classList.remove('dark');
@@ -2036,7 +2206,6 @@
               setSelectedFields(new Set());
           }, [selectedFields]);
 
-          // Trigger worker to flatten data when switching to data view or when schema/json updates
           const updateFlattenedPreview = useCallback(() => {
               if (viewMode !== 'tree' || previewMode !== 'table' || !json || !activeSchema) return;
               
@@ -2050,11 +2219,10 @@
                       json: isArrayMode ? json : [json],
                       schema: activeSchema,
                       aliases: effectiveAliases,
-                      limit: previewLimit ? 100 : 5000 // Send limit to worker
+                      limit: previewLimit ? 100 : 5000 
                   }
               });
               
-              // Calculate total rows in separate message
               worker.postMessage({
                   type: 'CALC_TOTAL_ROWS',
                   payload: {
@@ -2067,7 +2235,6 @@
                   const { type, payload } = e.data;
                   if (type === 'FLATTEN_SUCCESS') {
                       setFlattenedData(payload);
-                      // Don't terminate yet, wait for total count
                   } else if (type === 'TOTAL_ROWS_SUCCESS') {
                       setTotalRecords(payload);
                       setLoading(false);
@@ -2080,13 +2247,12 @@
               };
           }, [viewMode, previewMode, json, activeSchema, effectiveAliases, isArrayMode, previewLimit]);
 
-          // Trigger update on view change or dependency change (debounced/effect)
           useEffect(() => {
               if (viewMode === 'tree' && previewMode === 'table') {
-                  const timeout = setTimeout(updateFlattenedPreview, 500); // Debounce slightly
+                  const timeout = setTimeout(updateFlattenedPreview, 500); 
                   return () => clearTimeout(timeout);
               }
-          }, [updateFlattenedPreview, viewMode, previewMode]); // previewLimit change triggers updateFlattenedPreview which triggers this
+          }, [updateFlattenedPreview, viewMode, previewMode]); 
 
           const handleDownloadCSV = () => {
             if (!flattenedData || flattenedData.length === 0) return;
@@ -2123,35 +2289,38 @@
             document.body.removeChild(link);
         };
         
+        const handleDownloadJSON = () => {
+            if (!json) return;
+            const blob = new Blob([JSON.stringify(json, null, 2)], { type: 'application/json' });
+            const link = document.createElement("a");
+            const url = URL.createObjectURL(blob);
+            link.setAttribute("href", url);
+            const fileName = fileInfo?.name || 'data.json';
+            link.setAttribute("download", fileName);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        };
+        
         const handleExpandAll = () => viewMode === 'tree' ? setExpandSignal({ action: 'EXPAND', id: Date.now() }) : setSchemaExpandSignal({ action: 'EXPAND', id: Date.now() });
         const handleCollapseAll = () => viewMode === 'tree' ? setExpandSignal({ action: 'COLLAPSE', id: Date.now() }) : setSchemaExpandSignal({ action: 'COLLAPSE', id: Date.now() });
 
 
-          const processFile = useCallback((file) => {
-            setError(null);
-            setLoading(true);
-            setLoadingProgress({ status: 'Reading file...', percent: 10 });
-            setExpandSignal(null);
-            setSchemaExpandSignal(null); // Reset schema expansion state
-            setViewMode('tree');
-            setPreviewMode('json'); 
-            setTableAliases({}); 
-            setColumnAliases({}); 
-            setExcludedFields(new Set()); 
-            setSelectedFields(new Set());
-            setSearchTerm('');
-            setFlattenedData(null);
+          const processJsonData = useCallback((text, meta) => {
+              setError(null);
+              setLoading(true);
+              setLoadingProgress({ status: 'Processing...', percent: 10 });
+              setExpandSignal(null);
+              setSchemaExpandSignal(null);
+              setViewMode('tree');
+              setPreviewMode('json'); 
+              setTableAliases({}); 
+              setColumnAliases({}); 
+              setExcludedFields(new Set()); 
+              setSelectedFields(new Set());
+              setSearchTerm('');
+              setFlattenedData(null);
 
-            if (file.size > MAX_FILE_SIZE_BYTES) {
-              setError(`File size exceeds limit of ${MAX_FILE_SIZE_MB}MB.`);
-              setLoading(false);
-              return;
-            }
-
-            const reader = new FileReader();
-            
-            reader.onload = (e) => {
-              const text = e.target.result;
               const worker = createWorker();
               
               worker.postMessage({ 
@@ -2179,12 +2348,7 @@
 
                       setJson(parsed);
                       setSchemaData(schema);
-                      setFileInfo({
-                          name: file.name.length > 30 ? file.name.slice(0, 30) + '...' : file.name,
-                          fullName: file.name,
-                          size: (file.size / 1024).toFixed(2) + ' KB',
-                          type: file.type || 'application/json'
-                      });
+                      setFileInfo(meta);
                       
                       setLoading(false);
                       worker.terminate();
@@ -2200,15 +2364,40 @@
                   setLoading(false);
                   worker.terminate();
               };
-            };
-
-            reader.onerror = () => {
-              setError("Error reading file.");
-              setLoading(false);
-            };
-
-            reader.readAsText(file);
           }, [useSampling]);
+
+          const processFile = useCallback((file) => {
+            if (file.size > MAX_FILE_SIZE_BYTES) {
+              setError(`File size exceeds limit of ${MAX_FILE_SIZE_MB}MB.`);
+              return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                processJsonData(e.target.result, {
+                    name: file.name.length > 30 ? file.name.slice(0, 30) + '...' : file.name,
+                    fullName: file.name,
+                    size: (file.size / 1024).toFixed(2) + ' KB',
+                    type: file.type || 'application/json'
+                });
+            };
+            reader.onerror = () => setError("Error reading file.");
+            reader.readAsText(file);
+          }, [processJsonData]);
+
+          const handlePasteAnalyze = () => {
+              if (!pastedContent.trim()) {
+                  setError("Please paste some JSON content first.");
+                  return;
+              }
+              const sizeKB = (new Blob([pastedContent]).size / 1024).toFixed(2);
+              processJsonData(pastedContent, {
+                  name: 'Raw Input',
+                  fullName: 'Raw JSON Input',
+                  size: sizeKB + ' KB',
+                  type: 'application/json'
+              });
+          };
 
           const handleSchemaTypeChange = useCallback((fieldPath, newType) => {
             setSchemaData(prev => prev.map(item => item.field === fieldPath ? { ...item, type: newType } : item));
@@ -2220,8 +2409,6 @@
               setExcludedFields(new Set());
               setSelectedFields(new Set());
               setSearchTerm('');
-              // Fix: generateSchema is only available in worker context. 
-              // We reset types to original using stored originalType property.
               if (schemaData) {
                   setSchemaData(prev => prev.map(item => ({ ...item, type: item.originalType })));
               }
@@ -2234,11 +2421,12 @@
           const reset = () => {
             setJson(null); setSchemaData(null); setTableAliases({}); setColumnAliases({});
             setFileInfo(null); setError(null); setIsArrayMode(false); setTotalPages(0); setCurrentPage(0);
-            setExpandSignal(null); setSchemaExpandSignal(null); // Reset schema expansion state
+            setExpandSignal(null); setSchemaExpandSignal(null); 
             setSearchTerm('');
             setExcludedFields(new Set());
             setSelectedFields(new Set());
             setFlattenedData(null);
+            setPastedContent('');
             if (fileInputRef.current) fileInputRef.current.value = "";
           };
 
@@ -2258,7 +2446,9 @@
                       <div className="flex items-center gap-3">
                          <div className="p-2 bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400 rounded-lg shrink-0"><FileJson size={20} /></div>
                          <div className="min-w-0 max-w-[200px] lg:max-w-xs">
-                            <h2 className="font-semibold text-sm md:text-base truncate">{fileInfo?.name}</h2>
+                            <Tooltip content={fileInfo?.fullName} position="bottom">
+                                <h2 className="font-semibold text-sm md:text-base truncate cursor-default">{fileInfo?.name}</h2>
+                            </Tooltip>
                             <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400"><span>{fileInfo?.size}</span><span>•</span><span className="flex items-center gap-1 text-green-600 dark:text-green-400"><CheckCircle size={12} /> Valid</span></div>
                          </div>
                          <div className="flex items-center gap-1 ml-2 border-l border-slate-200 dark:border-slate-700 pl-3">
@@ -2323,41 +2513,92 @@
                     </div>
                 )}
 
-                {/* File Upload Zone */}
+                {/* File Upload / Paste Zone */}
                 {!json && (
                   <div 
-                    className={`flex-1 flex flex-col items-center justify-center relative border-2 border-dashed rounded-xl p-6 md:p-12 text-center transition-all duration-300 ease-in-out cursor-pointer ${isDragging ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 scale-[1.01]' : 'border-slate-300 dark:border-slate-700 hover:border-blue-400 dark:hover:border-blue-500 bg-white dark:bg-slate-800 shadow-sm'}`} 
+                    className="flex-1 flex flex-col items-center justify-center p-4 overflow-hidden animate-in fade-in slide-in-from-bottom-8 duration-500"
                     onDragOver={onDragOver} 
                     onDragLeave={onDragLeave} 
                     onDrop={onDrop}
-                    onClick={triggerUpload}
                   >
-                    <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept=".json,application/json" className="hidden" />
-                    <div className="flex flex-col items-center justify-center gap-4">
-                      <div className={`p-4 rounded-full ${isDragging ? 'bg-blue-100 text-blue-600' : 'bg-slate-100 dark:bg-slate-700 text-slate-400'}`}><Upload size={40} strokeWidth={1.5} /></div>
-                      <div className="space-y-1">
-                        <h3 className="text-lg font-semibold">Click to Upload or Drag & Drop</h3>
-                        <p className="text-slate-500 dark:text-slate-400 text-sm">JSON files up to {MAX_FILE_SIZE_MB}MB</p>
-                      </div>
-                      
-                      <div className="flex items-center gap-2 mt-4 px-3 py-2 bg-slate-50 dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-700" onClick={(e) => e.stopPropagation()}>
-                          <input type="checkbox" id="sampling" checked={useSampling} onChange={(e) => setUseSampling(e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500" />
-                          <Tooltip content="Smart Sampling" position="right">
-                            <label htmlFor="sampling" className="text-xs font-medium text-slate-600 dark:text-slate-300 flex items-center gap-1 cursor-pointer select-none">
-                                <Zap size={12} className={useSampling ? "text-amber-500" : "text-slate-400"} />
-                                Smart Sampling
-                            </label>
-                          </Tooltip>
-                      </div>
-                    </div>
-                  </div>
-                )}
+                    <div className={`w-full max-w-5xl h-full flex flex-col bg-white dark:bg-slate-800 rounded-xl shadow-2xl border transition-all duration-200 relative overflow-hidden ${isDragging ? 'border-blue-500 ring-2 ring-blue-500/20' : 'border-slate-200 dark:border-slate-700'}`}>
+                        {/* Drag Overlay */}
+                        {isDragging && (
+                            <div className="absolute inset-0 bg-blue-50/90 dark:bg-blue-900/90 backdrop-blur-sm z-50 flex flex-col items-center justify-center text-blue-600 dark:text-blue-300 pointer-events-none">
+                                <Upload size={48} className="mb-4 animate-bounce" />
+                                <h3 className="text-2xl font-bold">Drop JSON file here</h3>
+                            </div>
+                        )}
 
-                {error && (
-                  <div className="mt-6 flex-none p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg flex items-start gap-3 animate-in fade-in slide-in-from-top-4">
-                    <AlertCircle className="text-red-500 shrink-0 mt-0.5" size={20} />
-                    <div className="flex-1"><h3 className="text-red-800 dark:text-red-200 font-medium">Validation Failed</h3><p className="text-red-600 dark:text-red-300 text-sm mt-1">{error}</p></div>
-                    <button onClick={() => setError(null)} className="text-red-400 hover:text-red-600"><X size={18} /></button>
+                        {/* Toolbar - Buttons moved to top */}
+                        <div className="flex-none p-3 border-b border-slate-100 dark:border-slate-700 bg-slate-50/80 dark:bg-slate-800/80 backdrop-blur-sm flex flex-wrap items-center justify-between gap-4 relative z-20">
+                            {/* Left: Title + Sampling */}
+                            <div className="flex items-center gap-4">
+                                <div className="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200 uppercase tracking-wider pl-2">
+                                    <Code size={16} className="text-blue-500" /> 
+                                    <span>Input JSON</span>
+                                </div>
+                                
+                                <div className="h-4 w-px bg-slate-300 dark:bg-slate-600"></div>
+
+                                <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                                    <input type="checkbox" id="sampling" checked={useSampling} onChange={(e) => setUseSampling(e.target.checked)} className="rounded text-blue-600 focus:ring-blue-500 cursor-pointer" />
+                                    <Tooltip content="Analyze first 20 + every Nth record" position="bottom">
+                                        <label htmlFor="sampling" className="text-xs font-medium text-slate-600 dark:text-slate-300 flex items-center gap-1 cursor-pointer select-none">
+                                            <Zap size={12} className={useSampling ? "text-amber-500" : "text-slate-400"} />
+                                            Smart Sampling
+                                        </label>
+                                    </Tooltip>
+                                </div>
+                            </div>
+
+                            {/* Right: Actions */}
+                            <div className="flex items-center gap-2 pr-1">
+                                <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept=".json,application/json" className="hidden" />
+                                
+                                <button 
+                                    onClick={triggerUpload}
+                                    className="flex items-center gap-2 px-3 py-1.5 bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-600 rounded-lg text-xs font-medium transition-colors shadow-sm"
+                                >
+                                    <Upload size={14} /> Upload File
+                                </button>
+
+                                {pastedContent && (
+                                    <button 
+                                        onClick={() => setPastedContent('')}
+                                        className="text-slate-400 hover:text-red-500 dark:text-slate-500 dark:hover:text-red-400 text-xs font-medium px-2 transition-colors"
+                                    >
+                                        Clear
+                                    </button>
+                                )}
+                                
+                                <button 
+                                    onClick={handlePasteAnalyze}
+                                    disabled={!pastedContent.trim()}
+                                    className="flex items-center gap-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold uppercase tracking-wide transition-all shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none transform active:scale-95"
+                                >
+                                    <Database size={14} /> Visualize
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Text Area - Massive Size */}
+                        <div className="flex-1 relative bg-white dark:bg-slate-800 group z-0">
+                            <textarea 
+                                className="w-full h-full p-6 bg-transparent border-0 focus:ring-0 text-sm font-mono text-slate-700 dark:text-slate-300 resize-none outline-none placeholder:text-slate-400 leading-relaxed custom-scrollbar"
+                                placeholder={`Paste your JSON content here directly...\n\nOr drag and drop a .json file into this area.\n\nExample:\n[\n  { "id": 1, "name": "Alice", "role": "admin" },\n  { "id": 2, "name": "Bob", "role": "user" }\n]`}
+                                value={pastedContent}
+                                onChange={(e) => setPastedContent(e.target.value)}
+                                spellCheck={false}
+                            />
+                        </div>
+                        
+                        {/* Status Footer */}
+                        <div className="px-4 py-2 bg-slate-50 dark:bg-slate-900/50 border-t border-slate-100 dark:border-slate-800 text-[10px] text-slate-400 flex justify-between select-none">
+                            <span>Ready for input</span>
+                            <span className="font-mono">{pastedContent.length > 0 ? `${(new Blob([pastedContent]).size / 1024).toFixed(2)} KB` : '0 KB'}</span>
+                        </div>
+                    </div>
                   </div>
                 )}
 
@@ -2493,6 +2734,18 @@
                                                         </button>
                                                     </div>
                                                 )}
+
+                                                {previewMode === 'json' && (
+                                                    <div className="flex items-center gap-3 ml-2 border-l border-slate-200 dark:border-slate-700 pl-3 animate-in fade-in duration-200">
+                                                        <button 
+                                                            onClick={handleDownloadJSON}
+                                                            className="flex items-center gap-1.5 px-2 py-1 text-xs font-medium bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 dark:bg-green-900/20 dark:text-green-400 dark:border-green-800 dark:hover:bg-green-900/30 rounded transition-colors"
+                                                            title="Download JSON"
+                                                        >
+                                                            <Download size={14} /> <span className="font-mono font-bold">{'{}'}</span>
+                                                        </button>
+                                                    </div>
+                                                )}
                                             </div>
                                         )}
                                         {viewMode === 'schema' && <span className="flex items-center gap-2"><Database size={14}/> Schema</span>}
@@ -2542,8 +2795,11 @@
                             {/* Flattened Table View */}
                             <div className={`absolute inset-0 ${viewMode === 'tree' && previewMode === 'table' ? 'block' : 'hidden'}`}>
                                 <DataPreview 
+                                    key={fileInfo ? fileInfo.name + (fileInfo.size || '') : 'empty'}
                                     data={flattenedData}
-                                    columns={Object.values(effectiveAliases)}
+                                    columns={previewColumns}
+                                    columnMetadata={columnMetadata}
+                                    searchTerm={debouncedSearchTerm}
                                 />
                             </div>
                             {/* Schema Editor */}
