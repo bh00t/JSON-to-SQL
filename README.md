@@ -79,15 +79,6 @@ This project uses a modern stack implemented directly within the browser:
 
 ---
 
-## 📦 How to Run Locally
-
-1. Download the `index.html` file.
-2. Open the file in any modern web browser (Chrome, Firefox, Edge, Safari).
-
-That's it! You are ready to convert data offline.
-
----
-
 ## 🧠 Technical Architecture
 
 ### Data Flattening Logic
