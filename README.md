@@ -25,7 +25,7 @@ All parsing and schema inference happen locally in your browser. Your data never
 ### High Performance
 - **Web Workers**: Heavy computation (JSON parsing, flattening) is offloaded to a background thread to keep the UI responsive.
 - **Virtualization**: Efficiently renders tables with thousands of rows using virtual scrolling techniques.
-- **Smart Sampling**: Analyzes large datasets (up to 20MB+) by intelligently sampling rows to infer schemas quickly.
+- **Smart Sampling**: Analyzes large datasets (up to 50MB) by intelligently sampling rows to infer schemas quickly. Toggle on/off via the toolbar.
 
 ### Intelligent Schema Inference
 - Automatically detects data types (mapped to AWS Redshift/PostgreSQL standards).
@@ -38,9 +38,31 @@ All parsing and schema inference happen locally in your browser. Your data never
 
 ### Interactive UI
 - Tree view for exploring raw JSON structure.
-- Tabular preview of flattened data.
-- Customizable schema (rename columns, change data types, exclude fields).
-- Dark Mode support.
+- Tabular preview of flattened data with row limiting (100 rows / up to 5000).
+- Customizable schema: rename columns, change data types, exclude fields individually or in bulk.
+- Global search across keys, values, and fields.
+- Dark mode support.
+
+### Responsive Design
+- Fully usable on phones and tablets — the sidebar collapses into a horizontal tab bar on smaller screens.
+- All layout, spacing, and typography scale gracefully from mobile to wide desktop.
+
+### GitHub Integration
+- Quick link to the source repository from the header on every page.
+
+---
+
+## ⌨️ Keyboard Shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl+Enter` / `⌘↵` | Analyze / Visualize pasted JSON |
+| `Escape` | Clear and exit search |
+| `Ctrl+Shift+1` / `⌘⇧1` | Switch to Preview tab |
+| `Ctrl+Shift+2` / `⌘⇧2` | Switch to Schema tab |
+| `Ctrl+Shift+3` / `⌘⇧3` | Switch to Script tab |
+| `Ctrl+Shift+↑` / `⌘⇧↑` | Collapse all (Preview & Schema tabs) |
+| `Ctrl+Shift+↓` / `⌘⇧↓` | Expand all (Preview & Schema tabs) |
 
 ---
 
@@ -48,21 +70,26 @@ All parsing and schema inference happen locally in your browser. Your data never
 
 ### 1. Upload Data
 - Open the [Live Website](https://bh00t.github.io/JSON-to-SQL/) or open your local `index.html`.
-- Drag and drop a `.json` file (up to ~20MB) onto the drop zone.
+- **Option A**: Drag and drop a `.json` file (up to ~50MB) onto the drop zone.
+- **Option B**: Paste raw JSON directly into the text area and press **Visualize** (or `Ctrl+Enter`).
 
 ### 2. Explore
-- **Preview Tab**: See your raw JSON structure.
-- **Schema Tab**: Review inferred fields. You can uncheck fields to exclude them, rename columns using the alias inputs, or change data types.
-- **Data Preview**: Toggle between "JSON View" and "Data Preview" (Table) to see how the nested data flattens into rows.
+- **Preview Tab** (`Ctrl+1`): See your raw JSON structure in a collapsible tree. Toggle between JSON tree view and a flattened tabular preview.
+- **Schema Tab** (`Ctrl+2`): Review inferred fields. Uncheck fields to exclude them, rename columns via alias inputs, change data types, or bulk-edit multiple fields at once.
+- **Script Tab** (`Ctrl+3`): View the generated SQL. Choose between View Script (querying JSON columns directly) or Table DDL (creating new tables).
 
-### 3. Generate SQL
+### 3. Search
+- Use the search bar in the header (or press `Ctrl+K`) to filter keys, values, and fields across all views in real time.
+
+### 4. Generate SQL
 - Go to the **Script Tab**.
-- Choose between **View Script** (for querying JSON columns directly) or **Table DDL** (for creating new tables).
+- Choose between **View Script** or **Table DDL**.
 - Adjust configuration (Table Name, Diststyle, Sort Keys) in the config panel.
 
-### 4. Export
-- Click the copy button or download the SQL file directly.
-- You can also download the flattened data as a CSV.
+### 5. Export
+- Copy the SQL to clipboard or download it as a `.sql` file.
+- Download the flattened data preview as a **CSV**.
+- Download the raw parsed JSON directly.
 
 ---
 
@@ -72,8 +99,8 @@ This project uses a modern stack implemented directly within the browser:
 
 - **Core**: HTML5, JavaScript (ES6+)
 - **UI Framework**: React 18 (loaded via ESM)
-- **Styling**: Tailwind CSS (Utility-first framework)
-- **Compiler**: Babel Standalone (Compiles JSX on the fly)
+- **Styling**: Tailwind CSS (utility-first framework)
+- **Compiler**: Babel Standalone (compiles JSX on the fly)
 - **Icons**: Lucide React
 - **Architecture**: Web Workers for multi-threading
 
@@ -85,8 +112,8 @@ This project uses a modern stack implemented directly within the browser:
 
 The application solves the problem of mapping hierarchical JSON (trees) to relational SQL (tables) using a recursive "Explosion" strategy:
 
-- **Discovery**: It traverses the schema to find all array paths (e.g., `orders[]`, `orders[].items[]`).
-- **Context Expansion**: It iterates through records, creating a Cartesian product for every array level found. A single JSON object with an array of 5 items becomes 5 table rows.
+- **Discovery**: Traverses the schema to find all array paths (e.g., `orders[]`, `orders[].items[]`).
+- **Context Expansion**: Iterates through records, creating a Cartesian product for every array level found. A single JSON object with an array of 5 items becomes 5 table rows.
 - **Mapping**: Simple fields are then mapped to these expanded rows based on their depth in the hierarchy.
 
 ### The "Single File" Approach
