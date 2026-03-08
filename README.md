@@ -74,12 +74,12 @@ All parsing and schema inference happen locally in your browser. Your data never
 - **Option B**: Paste raw JSON directly into the text area and press **Visualize** (or `Ctrl+Enter`).
 
 ### 2. Explore
-- **Preview Tab** (`Ctrl+1`): See your raw JSON structure in a collapsible tree. Toggle between JSON tree view and a flattened tabular preview.
-- **Schema Tab** (`Ctrl+2`): Review inferred fields. Uncheck fields to exclude them, rename columns via alias inputs, change data types, or bulk-edit multiple fields at once.
-- **Script Tab** (`Ctrl+3`): View the generated SQL. Choose between View Script (querying JSON columns directly) or Table DDL (creating new tables).
+- **Preview Tab** (`Ctrl+Shift+1`): See your raw JSON structure in a collapsible tree. Toggle between JSON tree view and a flattened tabular preview.
+- **Schema Tab** (`Ctrl+Shift+2`): Review inferred fields. Uncheck fields to exclude them, rename columns via alias inputs, change data types, or bulk-edit multiple fields at once.
+- **Script Tab** (`Ctrl+Shift+3`): View the generated SQL. Choose between View Script (querying JSON columns directly) or Table DDL (creating new tables).
 
 ### 3. Search
-- Use the search bar in the header (or press `Ctrl+K`) to filter keys, values, and fields across all views in real time.
+- Use the search bar in the header to filter keys, values, and fields across all views in real time.
 
 ### 4. Generate SQL
 - Go to the **Script Tab**.
